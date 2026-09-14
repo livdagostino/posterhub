@@ -1,4 +1,3 @@
-
 POSTER_PROMPT = """
 Analyze this image. Determine if it contains any scientific or academic content
 with readable text. This includes: research posters, paper screenshots, article
@@ -11,6 +10,7 @@ Return ONLY valid JSON (no markdown) with these fields:
     "subfields": ["slug1", "slug2"],
     "conference": "Conference/venue if visible",
     "year": "Publication year if visible",
+    "arxiv_id": "arXiv identifier or arxiv.org paper URL only if explicitly visible",
     "institution": "University/institution if visible",
     "search_query": "Search query to find paper online (title + first author)",
     "github_query": "Short project name or method acronym for GitHub search"
@@ -41,6 +41,8 @@ scientific content, even from a screenshot or photo of a screen.
 Set is_research_poster to false ONLY if the image has no scientific text at all
 (e.g. selfie, meme, landscape, random photo with no readable academic content).
 If a field is not visible, use empty string "" (or empty list [] for subfields).
+Transcribe the visible title and authors faithfully. Do not invent authors,
+expand abbreviated names, rewrite the title, or guess an arXiv identifier.
 """
 
 WHY_USEFUL_PROMPT = """

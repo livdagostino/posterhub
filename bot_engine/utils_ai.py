@@ -2,10 +2,10 @@ import base64
 import io
 import json
 import logging
+import os
 import re
-import time
-import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus, urlparse
+import threading
+from urllib.parse import quote_plus, urljoin
 
 import requests
 import pypdf
@@ -13,11 +13,18 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from django.conf import settings
 
+from .paper_search import (
+    _arxiv_id, _best_match, _get_arxiv_paper,
+    _search_arxiv, _search_google_scholar, _title_similarity,
+    find_paper_from_github, search_paper,
+)
+
 from .prompts import (
     POSTER_PROMPT,
     WHY_USEFUL_PROMPT,
     DESCRIPTION_FROM_PDF_PROMPT,
     DESCRIPTION_FROM_SCRAPE_PROMPT,
+    DESCRIPTION_FROM_POSTER_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,7 +36,16 @@ HEADERS = {
     )
 }
 
-BLOCKED_DOMAINS = {"link.springer.com"}
+CONNECT_TIMEOUT = 5
+PAGE_TIMEOUT = (CONNECT_TIMEOUT, 15)
+PROBE_TIMEOUT = (CONNECT_TIMEOUT, 8)
+DOWNLOAD_TIMEOUT = (CONNECT_TIMEOUT, 30)
+MAX_PDF_BYTES = 50 * 1024 * 1024
+MAX_HTML_BYTES = 8 * 1024 * 1024
+MAX_PDF_TEXT_CHARS = 400_000
+GITHUB_API_TIMEOUT = (CONNECT_TIMEOUT, 10)
+OPENAI_MODEL = "gpt-4o"
+PDF_MAGIC = b"%PDF"
 
 VALID_SUBFIELDS = {
     "artificial_intelligence", "machine_learning", "deep_learning",
@@ -58,11 +74,152 @@ VALID_SUBFIELDS = {
 _SS_API_KEY = getattr(settings, "SEMANTIC_SCHOLAR_API_KEY", None) or ""
 _openai_key = getattr(settings, "OPENAI_API_KEY", None) or ""
 API_KEY_CONFIGURED = bool(_openai_key.strip())
-_openai_client = OpenAI(api_key=_openai_key) if API_KEY_CONFIGURED else None
+_openai_state = threading.local()
+_pdf_cache = threading.local()
+
+
+def _openai_client():
+    if not API_KEY_CONFIGURED:
+        return None
+    pid = os.getpid()
+    if getattr(_openai_state, "pid", None) != pid:
+        _openai_state.client = OpenAI(api_key=_openai_key)
+        _openai_state.pid = pid
+    return _openai_state.client
 
 
 def _ss_headers():
     return {"x-api-key": _SS_API_KEY} if _SS_API_KEY else {}
+
+
+def _github_headers():
+    headers = {"Accept": "application/vnd.github+json"}
+    token = (getattr(settings, "GITHUB_TOKEN", "") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _http_get(url, *, timeout=PAGE_TIMEOUT, headers=None, params=None, stream=False):
+    return requests.get(
+        url,
+        headers={**HEADERS, **(headers or {})},
+        params=params,
+        timeout=timeout,
+        allow_redirects=True,
+        stream=stream,
+    )
+
+
+def _http_head(url, *, timeout=PROBE_TIMEOUT, headers=None):
+    return requests.head(
+        url,
+        headers={**HEADERS, **(headers or {})},
+        timeout=timeout,
+        allow_redirects=True,
+    )
+
+
+def _read_capped(response, limit):
+    body = bytearray()
+    for chunk in response.iter_content(65536):
+        body.extend(chunk)
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
+def _content_type(response):
+    return response.headers.get("Content-Type", "").lower()
+
+
+def _fetch_html(url, *, timeout=PAGE_TIMEOUT):
+    if not url:
+        return None, ""
+    try:
+        response = _http_get(url, timeout=timeout, stream=True)
+    except requests.RequestException as e:
+        logger.debug("Page fetch failed for %s: %s", url, e)
+        return None, ""
+    try:
+        if response.status_code != 200:
+            return None, ""
+        body = _read_capped(response, MAX_HTML_BYTES)
+        if body is None:
+            logger.info("Page exceeds size limit, skipped: %s", url)
+            return None, ""
+        return BeautifulSoup(body, "html.parser"), response.url
+    except requests.RequestException as e:
+        logger.debug("Page read failed for %s: %s", url, e)
+        return None, ""
+    finally:
+        response.close()
+
+
+def _fetch_text(url, *, timeout=PAGE_TIMEOUT, html_only=True):
+    if not url:
+        return ""
+    try:
+        response = _http_get(url, timeout=timeout, stream=True)
+    except requests.RequestException as e:
+        logger.debug("Text fetch failed for %s: %s", url, e)
+        return ""
+    try:
+        if response.status_code != 200:
+            return ""
+        if html_only and "html" not in _content_type(response):
+            return ""
+        body = _read_capped(response, MAX_HTML_BYTES)
+        if body is None:
+            logger.info("Page exceeds size limit, skipped: %s", url)
+            return ""
+        return body.decode(response.encoding or "utf-8", errors="replace")
+    except requests.RequestException as e:
+        logger.debug("Text read failed for %s: %s", url, e)
+        return ""
+    finally:
+        response.close()
+
+
+def _vision_request(prompt, image_path, max_tokens, temperature):
+    return {
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": _encode_image_to_base64(image_path), "detail": "high"}},
+            ],
+        }],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+
+def _text_request(system_prompt, user_content, max_tokens, temperature):
+    return {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+
+def _complete(request_kwargs, purpose):
+    client = _openai_client()
+    if client is None:
+        return None
+    try:
+        response = client.chat.completions.create(model=OPENAI_MODEL, **request_kwargs)
+    except Exception as e:
+        logger.warning("OpenAI %s failed: %s", purpose, type(e).__name__)
+        return None
+    try:
+        return (response.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError, TypeError):
+        logger.warning("OpenAI %s returned an unusable response", purpose)
+        return None
 
 
 def _slugify(s):
@@ -101,27 +258,13 @@ def _fallback():
 
 def _url_exists(url):
     try:
-        return requests.head(
-            url, headers=HEADERS, timeout=5, allow_redirects=True
-        ).status_code == 200
-    except Exception:
+        return _http_head(url, timeout=PROBE_TIMEOUT).status_code == 200
+    except requests.RequestException:
         return False
 
 
 def _resolve_url(href, base_url):
-    if href.startswith("http"):
-        return href
-    if href.startswith("/"):
-        p = urlparse(base_url)
-        return f"{p.scheme}://{p.netloc}{href}"
-    return base_url.rsplit("/", 1)[0] + "/" + href
-
-
-def _is_blocked(url):
-    try:
-        return any(d in urlparse(url).netloc.lower() for d in BLOCKED_DOMAINS)
-    except Exception:
-        return False
+    return urljoin(base_url, href)
 
 
 def _encode_image_to_base64(image_path):
@@ -132,165 +275,57 @@ def _encode_image_to_base64(image_path):
     return f"data:{mime};base64,{b64}"
 
 
-
 def extract_poster_info(image_path):
-    if not API_KEY_CONFIGURED or _openai_client is None:
+    try:
+        request_kwargs = _vision_request(POSTER_PROMPT, image_path, 1024, 0.2)
+    except OSError as e:
+        logger.error("Poster image unreadable at %s: %s", image_path, e)
+        return _fallback()
+    text = _complete(request_kwargs, "poster extraction")
+    if text is None:
         return _fallback()
     try:
-        data_url = _encode_image_to_base64(image_path)
-        response = _openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": POSTER_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                ],
-            }],
-            max_tokens=1024,
-            temperature=0.2,
-        )
-        text = response.choices[0].message.content or ""
-        clean = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
-    except Exception:
+        return json.loads(text.replace("```json", "").replace("```", "").strip())
+    except (ValueError, TypeError):
+        logger.warning("Poster extraction returned malformed JSON")
         return _fallback()
 
 
-
-def _search_semantic_scholar(query, limit=5):
-    for attempt in range(2):
-        try:
-            resp = requests.get(
-                "https://api.semanticscholar.org/graph/v1/paper/search",
-                params={
-                    "query": query,
-                    "fields": "title,url,authors,externalIds,openAccessPdf,year,abstract",
-                    "limit": limit,
-                },
-                headers=_ss_headers(),
-                timeout=10,
-            )
-            if resp.status_code == 429 and attempt == 0:
-                time.sleep(3)
-                continue
-            if resp.status_code != 200:
-                return []
-            results = []
-            for paper in resp.json().get("data", []):
-                ext = paper.get("externalIds") or {}
-                arxiv_id = ext.get("ArXiv", "")
-                if arxiv_id:
-                    paper_url = f"https://arxiv.org/abs/{arxiv_id}"
-                    pdf_url   = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-                else:
-                    paper_url = paper.get("url", "")
-                    pdf_url   = (paper.get("openAccessPdf") or {}).get("url", "")
-                authors = ", ".join(
-                    a.get("name", "")
-                    for a in (paper.get("authors") or [])
-                    if a.get("name")
-                )
-                results.append({
-                    "title":     paper.get("title", ""),
-                    "paper_url": paper_url,
-                    "pdf_url":   pdf_url,
-                    "authors":   authors,
-                    "arxiv_id":  arxiv_id,
-                    "doi":       ext.get("DOI", ""),
-                    "abstract":  paper.get("abstract", "") or "",
-                    "year":      paper.get("year"),
-                    "_blocked":  _is_blocked(paper_url),
-                })
-            return results
-        except Exception as e:
-            logger.warning("Semantic Scholar search failed: %s", e)
-            return []
-    return []
-
-
-def _search_google_scholar(query, limit=5):
-    try:
-        soup = BeautifulSoup(
-            requests.get(
-                f"https://scholar.google.com/scholar?q={quote_plus(query)}",
-                headers=HEADERS,
-                timeout=10,
-            ).text,
-            "html.parser",
-        )
-        results = []
-        for card in soup.select(".gs_r.gs_or")[:limit]:
-            ri = card.select_one(".gs_ri")
-            if not ri:
-                continue
-            a = ri.select_one(".gs_rt a")
-            if not a:
-                continue
-            href = a.get("href", "")
-            if not href:
-                continue
-            pdf_a = card.select_one(".gs_or_ggsm a")
-            results.append({
-                "title":     a.text,
-                "paper_url": href,
-                "pdf_url":   pdf_a.get("href", "") if pdf_a else "",
-                "authors":   "",
-                "arxiv_id":  "",
-                "doi":       "",
-                "_blocked":  _is_blocked(href),
-            })
-        return results
-    except Exception:
-        return []
-
-
-def _title_similarity(query, candidate_title):
-    if not query or not candidate_title:
-        return 0.0
-    q_words = set(re.findall(r"\w{3,}", query.lower()))
-    c_words = set(re.findall(r"\w{3,}", candidate_title.lower()))
-    if not q_words or not c_words:
-        return 0.0
-    overlap = len(q_words & c_words)
-    return max(overlap / len(q_words), overlap / len(c_words))
-
-
-def search_paper(query):
-    if not query or not query.strip():
-        return None
-    blocked_fallback = None
-    for source_fn in (_search_semantic_scholar, _search_google_scholar):
-        for r in source_fn(query):
-            if _title_similarity(query, r.get("title", "")) < 0.55:
-                logger.debug("Skipping low-match result: %s", r.get("title", ""))
-                continue
-            if not r.get("_blocked"):
-                return r
-            if not blocked_fallback:
-                blocked_fallback = r
-    return blocked_fallback
-
+def _looks_like_pdf(content_type, prefix):
+    if prefix.startswith(PDF_MAGIC):
+        return True
+    return "pdf" in content_type and not prefix.lstrip()[:15].lower().startswith(b"<!doctype")
 
 
 def _is_valid_pdf_url(url):
     if not url:
         return False
-    if url.lower().endswith(".pdf"):
-        return True
     if "doi.org/" in url:
         return False
     try:
-        resp = requests.head(url, headers=HEADERS, timeout=8, allow_redirects=True)
-        ct = resp.headers.get("Content-Type", "").lower()
-        if resp.status_code == 200 and "pdf" in ct:
-            return True
-        resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True, stream=True)
-        ct = resp.headers.get("Content-Type", "").lower()
-        resp.close()
-        return resp.status_code == 200 and "pdf" in ct
-    except Exception:
+        with _http_head(url) as response:
+            if response.status_code == 200 and "pdf" in _content_type(response):
+                return True
+    except requests.RequestException:
+        pass
+    try:
+        response = _http_get(url, timeout=PROBE_TIMEOUT, stream=True)
+    except requests.RequestException:
         return False
+    try:
+        content_type = _content_type(response)
+        if response.status_code != 200:
+            logger.info("PDF candidate rejected: HTTP %s, url=%s", response.status_code, url)
+            return False
+        prefix = next(response.iter_content(1024), b"")
+        if _looks_like_pdf(content_type, prefix):
+            return True
+        logger.info("PDF candidate rejected: type=%s, url=%s", content_type, url)
+        return False
+    except requests.RequestException:
+        return False
+    finally:
+        response.close()
 
 
 def _find_pdf_url(soup, base_url):
@@ -318,81 +353,65 @@ def _find_pdf_url(soup, base_url):
 
 
 def _find_pdf_via_arxiv(title):
-    if not title:
-        return ""
-    try:
-        resp = requests.get(
-            "http://export.arxiv.org/api/query",
-            params={"search_query": f'ti:"{title}"', "max_results": 1},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return ""
-        root = ET.fromstring(resp.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for entry in root.findall("atom:entry", ns):
-            for link in entry.findall("atom:link", ns):
-                if link.get("type") == "application/pdf" or link.get("title") == "pdf":
-                    return link.get("href", "").replace("http://", "https://")
-    except Exception as e:
-        logger.debug("arXiv title search failed: %s", e)
-    return ""
+    paper = _best_match(title, _search_arxiv(title)) if title else None
+    return paper.get("pdf_url", "") if paper else ""
 
 
 def _get_pdf_from_stamp(stamp_url):
-    try:
-        resp = requests.get(stamp_url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return ""
-        soup   = BeautifulSoup(resp.text, "html.parser")
-        iframe = soup.find("iframe")
-        if iframe and iframe.get("src", ""):
-            src = iframe["src"]
-            if not src.startswith("http"):
-                src = f"https://ieeexplore.ieee.org{src}"
-            return src
-    except Exception:
-        pass
-    return ""
+    soup, final_url = _fetch_html(stamp_url)
+    if soup is None:
+        return ""
+    iframe = soup.find("iframe")
+    src = iframe.get("src", "") if iframe else ""
+    return _resolve_url(src, final_url or "https://ieeexplore.ieee.org/") if src else ""
 
 
 def _get_ieee_pdf(doi):
     try:
-        resp = requests.get(
-            f"https://doi.org/{doi}", headers=HEADERS, timeout=15, allow_redirects=True,
-        )
-        if resp.status_code != 200:
-            return ""
-        m = re.search(r"/document/(\d+)", resp.url)
-        if not m:
-            return ""
-        return _get_pdf_from_stamp(
-            f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={m.group(1)}"
-        )
-    except Exception as e:
+        response = _http_get(f"https://doi.org/{doi}", stream=True)
+    except requests.RequestException as e:
         logger.debug("IEEE PDF extraction failed for DOI %s: %s", doi, e)
-    return ""
+        return ""
+    try:
+        if response.status_code != 200:
+            return ""
+        m = re.search(r"/document/(\d+)", response.url)
+    finally:
+        response.close()
+    if not m:
+        return ""
+    return _get_pdf_from_stamp(
+        f"https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber={m.group(1)}"
+    )
 
 
 def _get_pdf_from_page(page_url):
     if not page_url:
         return ""
     if page_url.lower().endswith(".pdf"):
-        return page_url
-    try:
-        resp = requests.get(page_url, headers=HEADERS, timeout=15, allow_redirects=True)
-        if resp.status_code != 200:
-            return ""
-        soup = BeautifulSoup(resp.text, "html.parser")
-        pdf  = _find_pdf_url(soup, resp.url)
-        if pdf and _is_valid_pdf_url(pdf):
+        return page_url if _is_valid_pdf_url(page_url) else ""
+    identifier = _arxiv_id(page_url)
+    if identifier:
+        pdf = f"https://arxiv.org/pdf/{identifier}"
+        if _is_valid_pdf_url(pdf):
             return pdf
-        if pdf and "stamp.jsp" in pdf:
-            return _get_pdf_from_stamp(pdf)
-        return pdf or ""
-    except Exception as e:
-        logger.debug("Page scrape failed for %s: %s", page_url, e)
+    soup, final_url = _fetch_html(page_url)
+    if soup is None:
+        return ""
+    pdf = _find_pdf_url(soup, final_url)
+    if not pdf:
+        return ""
+    if _is_valid_pdf_url(pdf):
+        return pdf
+    if "stamp.jsp" in pdf:
+        return _get_pdf_from_stamp(pdf)
     return ""
+
+
+PUBLISHER_PDF_TEMPLATES = (
+    (r"^10\.1007/", "https://link.springer.com/content/pdf/{doi}.pdf"),
+    (r"^10\.1145/", "https://dl.acm.org/doi/pdf/{doi}"),
+)
 
 
 def _get_pdf_from_doi(doi):
@@ -402,39 +421,28 @@ def _get_pdf_from_doi(doi):
         pdf = _get_ieee_pdf(doi)
         if pdf:
             return pdf
-    if re.match(r"^10\.1007/", doi):
-        url = f"https://link.springer.com/content/pdf/{doi}.pdf"
-        if _is_valid_pdf_url(url):
-            return url
-    if re.match(r"^10\.1145/", doi):
-        url = f"https://dl.acm.org/doi/pdf/{doi}"
-        if _is_valid_pdf_url(url):
-            return url
-    try:
-        resp = requests.get(
-            f"https://doi.org/{doi}", headers=HEADERS, timeout=15, allow_redirects=True,
-        )
-        if resp.status_code == 200:
-            pdf = _find_pdf_url(BeautifulSoup(resp.text, "html.parser"), resp.url)
-            if pdf:
-                return pdf
-    except Exception:
-        pass
-    return ""
+    for prefix, template in PUBLISHER_PDF_TEMPLATES:
+        if re.match(prefix, doi):
+            url = template.format(doi=doi)
+            if _is_valid_pdf_url(url):
+                return url
+    soup, final_url = _fetch_html(f"https://doi.org/{doi}")
+    if soup is None:
+        return ""
+    return _find_pdf_url(soup, final_url)
 
 
 def _find_pdf_via_google_scholar(title):
     if not title:
         return ""
-    try:
-        for result in _search_google_scholar(title, limit=3):
-            if _title_similarity(title, result.get("title", "")) < 0.55:
-                continue
-            pdf = result.get("pdf_url", "")
-            if pdf and _is_valid_pdf_url(pdf):
-                return pdf
-    except Exception as e:
-        logger.debug("Google Scholar PDF search failed: %s", e)
+    candidates = _search_google_scholar(title, limit=5)
+    ranked = sorted(candidates, key=lambda p: _title_similarity(title, p.get("title", "")), reverse=True)
+    for result in ranked:
+        if not _best_match(title, [result]):
+            continue
+        pdf = result.get("pdf_url", "")
+        if pdf and _is_valid_pdf_url(pdf):
+            return pdf
     return ""
 
 
@@ -450,14 +458,13 @@ def _find_real_pdf(pdf_url_hint="", paper_link="", doi="", title=""):
         if pdf:
             return pdf
     if title:
-        pdf = _find_pdf_via_google_scholar(title)
-        if pdf:
-            return pdf
         pdf = _find_pdf_via_arxiv(title)
         if pdf:
             return pdf
+        pdf = _find_pdf_via_google_scholar(title)
+        if pdf:
+            return pdf
     return ""
-
 
 
 def _extract_github_from_annotations(reader):
@@ -471,15 +478,18 @@ def _extract_github_from_annotations(reader):
                 annots = annots.get_object()
             for annot in annots:
                 annot_obj = annot.get_object() if hasattr(annot, "get_object") else annot
-                if annot_obj.get("/Subtype") == "/Link":
-                    action = annot_obj.get("/A")
-                    if action:
-                        if hasattr(action, "get_object"):
-                            action = action.get_object()
-                        uri = action.get("/URI", "")
-                        if uri and "github.com" in uri.lower():
-                            urls.append(uri)
-        except Exception:
+                if annot_obj.get("/Subtype") != "/Link":
+                    continue
+                action = annot_obj.get("/A")
+                if not action:
+                    continue
+                if hasattr(action, "get_object"):
+                    action = action.get_object()
+                uri = action.get("/URI", "")
+                if isinstance(uri, str) and "github.com" in uri.lower():
+                    urls.append(uri)
+        except (pypdf.errors.PyPdfError, AttributeError, TypeError, KeyError, ValueError) as e:
+            logger.debug("Unreadable PDF annotations skipped: %s", type(e).__name__)
             continue
     return urls
 
@@ -492,7 +502,7 @@ def _normalize_github_urls_in_text(text):
 
 def _fix_duplicated_name(url):
     parts = url.split("/")
-    name  = parts[-1]
+    name = parts[-1]
     owner = parts[-2]
     for length in range(4, len(name) // 2 + 1):
         prefix = name[:length]
@@ -546,100 +556,143 @@ def _first_valid_github(text):
     return ""
 
 
-MAX_PDF_BYTES = 50 * 1024 * 1024
+def _download_pdf_safe(url, timeout=DOWNLOAD_TIMEOUT):
+    cached = getattr(_pdf_cache, "entry", None)
+    if cached and cached[0] == url:
+        return cached[1]
+    result = _fetch_pdf(url, timeout)
+    _pdf_cache.entry = (url, result)
+    return result
 
 
-def _download_pdf_safe(url, timeout=30):
-    resp = requests.get(url, headers=HEADERS, timeout=timeout, stream=True)
-    if resp.status_code != 200:
-        resp.close()
+def _fetch_pdf(url, timeout):
+    try:
+        response = _http_get(url, timeout=timeout, stream=True)
+    except requests.RequestException as e:
+        logger.warning("PDF download failed for %s: %s", url, type(e).__name__)
         return None
-    size = int(resp.headers.get("Content-Length", 0) or 0)
-    if size > MAX_PDF_BYTES:
-        resp.close()
-        return None
-    chunks, total = [], 0
-    for chunk in resp.iter_content(65536):
-        total += len(chunk)
-        if total > MAX_PDF_BYTES:
-            resp.close()
+    try:
+        if response.status_code != 200:
+            logger.warning("PDF download returned HTTP %s: %s", response.status_code, url)
             return None
-        chunks.append(chunk)
-    resp.close()
-    return b"".join(chunks), resp
+        declared = response.headers.get("Content-Length", "")
+        if declared.isdigit() and int(declared) > MAX_PDF_BYTES:
+            logger.warning("PDF exceeds download size limit: %s", url)
+            return None
+        content = _read_capped(response, MAX_PDF_BYTES)
+        if content is None:
+            logger.warning("PDF exceeds download size limit: %s", url)
+            return None
+        return content, _content_type(response), response.url
+    except requests.RequestException as e:
+        logger.warning("PDF download interrupted for %s: %s", url, type(e).__name__)
+        return None
+    finally:
+        response.close()
+
+
+def _clear_pdf_cache():
+    _pdf_cache.entry = None
+
+
+def _read_pdf(pdf_url):
+    result = _download_pdf_safe(pdf_url)
+    if result is None:
+        return None
+    content, content_type, final_url = result
+    if not content.startswith(PDF_MAGIC) and "html" in content_type:
+        soup = BeautifulSoup(content, "html.parser")
+        real_pdf = _find_pdf_url(soup, final_url)
+        if not real_pdf or real_pdf == pdf_url:
+            return None
+        nested = _download_pdf_safe(real_pdf)
+        if nested is None:
+            return None
+        content = nested[0]
+    if not content.startswith(PDF_MAGIC):
+        logger.info("Discarded non-PDF payload from %s", pdf_url)
+        return None
+    try:
+        return pypdf.PdfReader(io.BytesIO(content))
+    except (pypdf.errors.PyPdfError, ValueError, OSError, RecursionError) as e:
+        logger.info("Unreadable PDF at %s: %s", pdf_url, type(e).__name__)
+        return None
 
 
 def _find_github_in_pdf(pdf_url):
     if not pdf_url:
         return ""
-    try:
-        result = _download_pdf_safe(pdf_url)
-        if result is None:
-            return ""
-        content, resp = result
-        if "html" in resp.headers.get("Content-Type", "").lower():
-            real_pdf = _find_pdf_url(BeautifulSoup(content.decode("utf-8", errors="replace"), "html.parser"), resp.url)
-            if not real_pdf:
-                return ""
-            result2 = _download_pdf_safe(real_pdf)
-            if result2 is None:
-                return ""
-            content, resp = result2
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        for url in _extract_github_from_annotations(reader):
-            result = _first_valid_github(url)
-            if result:
-                return result
-        text = "".join(page.extract_text() or "" for page in reader.pages)
-        if not text:
-            return ""
-        return _first_valid_github(_normalize_github_urls_in_text(text))
-    except Exception as e:
-        logger.debug("PDF GitHub extraction error for %s: %s", pdf_url, e)
+    reader = _read_pdf(pdf_url)
+    if reader is None:
         return ""
+    for url in _extract_github_from_annotations(reader):
+        found = _first_valid_github(url)
+        if found:
+            return found
+    text = _pdf_text(reader)
+    if not text:
+        return ""
+    return _first_valid_github(_normalize_github_urls_in_text(text))
+
+
+def _pdf_text(reader, max_pages=None):
+    pages = reader.pages if max_pages is None else reader.pages[:max_pages]
+    collected, length = [], 0
+    for page in pages:
+        try:
+            extracted = page.extract_text() or ""
+        except (pypdf.errors.PyPdfError, ValueError, TypeError, KeyError, RecursionError) as e:
+            logger.debug("Unreadable PDF page skipped: %s", type(e).__name__)
+            continue
+        collected.append(extracted)
+        length += len(extracted)
+        if length >= MAX_PDF_TEXT_CHARS:
+            break
+    return "\n".join(collected)[:MAX_PDF_TEXT_CHARS]
 
 
 def _search_github_api(title, github_query=""):
     if not github_query or not github_query.strip():
         return ""
     gq = github_query.strip().lower()
-    if title:
-        title_tokens = {w.lower() for w in re.findall(r"[\w\-]+", title)}
-        if gq not in title_tokens:
-            return ""
-    else:
+    if not title:
+        return ""
+    title_tokens = {w.lower() for w in re.findall(r"[\w\-]+", title)}
+    if gq not in title_tokens:
         return ""
     try:
-        resp = requests.get(
+        response = _http_get(
             "https://api.github.com/search/repositories",
             params={"q": gq, "sort": "best-match", "per_page": 5},
-            headers={"Accept": "application/vnd.github.v3+json"},
-            timeout=10,
+            headers=_github_headers(),
+            timeout=GITHUB_API_TIMEOUT,
         )
-        if resp.status_code != 200:
+    except requests.RequestException as e:
+        logger.info("GitHub repository search failed: %s", type(e).__name__)
+        return ""
+    try:
+        if response.status_code != 200:
+            logger.info("GitHub repository search returned HTTP %s", response.status_code)
             return ""
-        for item in resp.json().get("items", []):
-            repo_name = (item.get("name") or "").strip().lower()
-            if repo_name == gq:
-                return item.get("html_url", "")
-    except Exception:
-        pass
+        items = response.json().get("items", [])
+    except (ValueError, AttributeError):
+        logger.info("GitHub repository search returned malformed results")
+        return ""
+    finally:
+        response.close()
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("name") or "").strip().lower() == gq:
+            return item.get("html_url", "")
     return ""
 
 
 def _scrape_page_for_github(url):
-    if not url:
-        return ""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
-        if resp.status_code != 200:
-            return ""
-        if "html" not in resp.headers.get("Content-Type", "").lower():
-            return ""
-        return _first_valid_github(resp.text)
-    except Exception as e:
-        logger.debug("Page GitHub scan error for %s: %s", url, e)
-    return ""
+    text = _fetch_text(url)
+    return _first_valid_github(text) if text else ""
 
 
 def find_github_repo(pdf_url="", title="", github_query="", paper_url="", doi=""):
@@ -666,25 +719,26 @@ def find_github_repo(pdf_url="", title="", github_query="", paper_url="", doi=""
     return ""
 
 
-
 def _extract_authors_from_html(soup):
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
-            for item in (data if isinstance(data, list) else [data]):
-                raw = item.get("author", [])
-                if isinstance(raw, str) and raw.strip():
-                    return raw.strip()
-                if isinstance(raw, list):
-                    names = [
-                        a.get("name", "") if isinstance(a, dict) else str(a)
-                        for a in raw
-                    ]
-                    names = [n for n in names if n.strip()]
-                    if names:
-                        return ", ".join(names)
-        except Exception:
+        except (ValueError, TypeError):
             continue
+        for item in (data if isinstance(data, list) else [data]):
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("author", [])
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+            if isinstance(raw, list):
+                names = [
+                    a.get("name", "") if isinstance(a, dict) else str(a)
+                    for a in raw
+                ]
+                names = [n for n in names if n.strip()]
+                if names:
+                    return ", ".join(names)
 
     tags = soup.find_all(
         "meta",
@@ -703,142 +757,93 @@ def _extract_authors_from_html(soup):
 
 
 def _authors_from_arxiv(arxiv_id):
-    try:
-        resp = requests.get(
-            f"http://export.arxiv.org/api/query?id_list={arxiv_id}", timeout=10,
-        )
-        if resp.status_code == 200:
-            entry = BeautifulSoup(resp.text, "xml").find("entry")
-            if entry:
-                names = [
-                    a.find("name").text.strip()
-                    for a in entry.find_all("author")
-                    if a.find("name")
-                ]
-                if names:
-                    return ", ".join(names)
-    except Exception:
-        pass
-    return ""
+    paper = _get_arxiv_paper(arxiv_id)
+    return paper.get("authors", "") if paper else ""
 
 
 def _authors_from_semantic_scholar(identifier):
     try:
-        resp = requests.get(
+        response = _http_get(
             f"https://api.semanticscholar.org/graph/v1/paper/{quote_plus(identifier)}",
             params={"fields": "authors"},
             headers=_ss_headers(),
-            timeout=10,
+            timeout=GITHUB_API_TIMEOUT,
         )
-        if resp.status_code == 200:
-            names = [
-                a["name"]
-                for a in resp.json().get("authors", [])
-                if a.get("name")
-            ]
-            if names:
-                return ", ".join(names)
-    except Exception:
-        pass
-    return ""
+    except requests.RequestException as e:
+        logger.debug("Semantic Scholar author lookup failed: %s", type(e).__name__)
+        return ""
+    try:
+        if response.status_code != 200:
+            return ""
+        names = [a["name"] for a in response.json().get("authors", []) if a.get("name")]
+        return ", ".join(names) if names else ""
+    except (ValueError, AttributeError, TypeError):
+        logger.debug("Semantic Scholar returned malformed author metadata")
+        return ""
+    finally:
+        response.close()
+
+
+DOI_PATTERN = re.compile(r"(10\.\d{4,9}/[\-\._();/:A-Z0-9]+)", re.I)
 
 
 def fetch_authors(paper_url, title=""):
     if not paper_url and not title:
         return ""
 
-    m = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5})", paper_url or "", re.I)
-    if m:
-        result = _authors_from_arxiv(m.group(1))
+    identifier = _arxiv_id(paper_url)
+    if identifier:
+        result = _authors_from_arxiv(identifier)
         if result:
             return result
 
-    doi_m = re.search(r"(10\.\d{4,9}/[\-\._();/:A-Z0-9]+)", paper_url or "", re.I)
+    doi_m = DOI_PATTERN.search(paper_url or "")
     if doi_m:
         result = _authors_from_semantic_scholar(f"DOI:{doi_m.group(1)}")
         if result:
             return result
 
     if paper_url:
-        try:
-            resp = requests.get(paper_url, headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                result = _extract_authors_from_html(soup)
-                if result:
-                    return result
-                if not doi_m:
-                    doi_in_page = re.search(
-                        r"(10\.\d{4,9}/[\-\._();/:A-Z0-9]+)", resp.text, re.I,
-                    )
-                    if doi_in_page:
-                        result = _authors_from_semantic_scholar(f"DOI:{doi_in_page.group(1)}")
-                        if result:
-                            return result
-        except Exception:
-            pass
+        page = _fetch_text(paper_url, timeout=GITHUB_API_TIMEOUT, html_only=False)
+        if page:
+            result = _extract_authors_from_html(BeautifulSoup(page, "html.parser"))
+            if result:
+                return result
+            if not doi_m:
+                doi_in_page = DOI_PATTERN.search(page)
+                if doi_in_page:
+                    result = _authors_from_semantic_scholar(f"DOI:{doi_in_page.group(1)}")
+                    if result:
+                        return result
 
     if title and title.strip():
-        try:
-            resp = requests.get(
-                "https://api.semanticscholar.org/graph/v1/paper/search",
-                params={"query": title, "fields": "authors", "limit": 1},
-                headers=_ss_headers(),
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                papers = resp.json().get("data", [])
-                if papers:
-                    names = [a["name"] for a in papers[0].get("authors", []) if a.get("name")]
-                    if names:
-                        return ", ".join(names)
-        except Exception:
-            pass
+        paper = search_paper(title)
+        if paper:
+            return paper.get("authors", "")
 
     return ""
-
 
 
 def _extract_text_from_pdf(pdf_url, max_pages=8):
     if not pdf_url:
         return ""
-    try:
-        result = _download_pdf_safe(pdf_url)
-        if result is None:
-            return ""
-        content, resp = result
-        if "html" in resp.headers.get("Content-Type", "").lower():
-            return ""
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        text   = "\n".join(page.extract_text() or "" for page in reader.pages[:max_pages])
-        text   = re.sub(r"[ \t]+", " ", text)
-        text   = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
-    except Exception as e:
-        logger.debug("PDF text extraction failed for %s: %s", pdf_url, e)
+    reader = _read_pdf(pdf_url)
+    if reader is None:
         return ""
+    text = _pdf_text(reader, max_pages=max_pages)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _generate_description_from_pdf(pdf_url):
-    if not API_KEY_CONFIGURED or _openai_client is None:
-        return ""
     pdf_text = _extract_text_from_pdf(pdf_url)
     if not pdf_text or len(pdf_text) < 200:
         return ""
-    try:
-        response = _openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": DESCRIPTION_FROM_PDF_PROMPT},
-                {"role": "user",   "content": pdf_text[:12000]},
-            ],
-            max_tokens=300,
-            temperature=0.3,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.warning("GPT description-from-PDF failed: %s", e)
-        return ""
+    return _complete(
+        _text_request(DESCRIPTION_FROM_PDF_PROMPT, pdf_text[:12000], 300, 0.3),
+        "description from PDF",
+    ) or ""
 
 
 def _shorten_scraped_description(raw_text):
@@ -846,63 +851,52 @@ def _shorten_scraped_description(raw_text):
         return ""
     if len(raw_text.split()) <= 100:
         return raw_text
-    if not API_KEY_CONFIGURED or _openai_client is None:
-        return raw_text
-    try:
-        response = _openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": DESCRIPTION_FROM_SCRAPE_PROMPT},
-                {"role": "user",   "content": raw_text[:6000]},
-            ],
-            max_tokens=250,
-            temperature=0.3,
-        )
-        shortened = (response.choices[0].message.content or "").strip()
-        return shortened if shortened else raw_text
-    except Exception as e:
-        logger.warning("GPT description-from-scrape failed: %s", e)
-        return raw_text
+    shortened = _complete(
+        _text_request(DESCRIPTION_FROM_SCRAPE_PROMPT, raw_text[:6000], 250, 0.3),
+        "description from page",
+    )
+    return shortened or raw_text
+
+
+ABSTRACT_SELECTORS = (
+    "#Abs1-content", "#Abs1 p", ".c-article-section__content",
+    ".abstract-content", ".abstractSection", ".abstract",
+    "#abstract", "[class*='abstract']", ".paper-abstract", ".article-abstract",
+)
+
+ABSTRACT_META_TAGS = (
+    {"name": "citation_abstract"},
+    {"name": "DC.description"},
+    {"name": "description"},
+    {"property": "og:description"},
+)
+
+ABSTRACT_PREFIX = re.compile(r"^Abstract:?\s*", re.I)
 
 
 def _scrape_raw_from_site(paper_url):
-    if not paper_url:
+    soup, _ = _fetch_html(paper_url)
+    if soup is None:
         return ""
-    try:
-        resp = requests.get(paper_url, headers=HEADERS, timeout=15, allow_redirects=True)
-        if resp.status_code != 200:
-            return ""
-        soup = BeautifulSoup(resp.text, "html.parser")
 
-        bq = soup.find("blockquote", class_="abstract")
-        if bq:
-            text = re.sub(r"^Abstract:?\s*", "", bq.get_text(separator=" ").strip(), flags=re.I)
-            if text:
+    bq = soup.find("blockquote", class_="abstract")
+    if bq:
+        text = ABSTRACT_PREFIX.sub("", bq.get_text(separator=" ").strip())
+        if text:
+            return text
+
+    for css in ABSTRACT_SELECTORS:
+        el = soup.select_one(css)
+        if el:
+            text = ABSTRACT_PREFIX.sub("", el.get_text(separator=" ").strip())
+            if len(text) > 80:
                 return text
 
-        for css in (
-            "#Abs1-content", "#Abs1 p", ".c-article-section__content",
-            ".abstract-content", ".abstractSection", ".abstract",
-            "#abstract", "[class*='abstract']", ".paper-abstract", ".article-abstract",
-        ):
-            el = soup.select_one(css)
-            if el:
-                text = re.sub(r"^Abstract:?\s*", "", el.get_text(separator=" ").strip(), flags=re.I)
-                if len(text) > 80:
-                    return text
+    for attrs in ABSTRACT_META_TAGS:
+        tag = soup.find("meta", attrs)
+        if tag and tag.get("content", "").strip():
+            return tag["content"].strip()
 
-        for sel, attr in (
-            ({"name": "citation_abstract"}, "content"),
-            ({"name": "DC.description"},    "content"),
-            ({"name": "description"},        "content"),
-            ({"property": "og:description"}, "content"),
-        ):
-            tag = soup.find("meta", sel)
-            if tag and tag.get(attr, "").strip():
-                return tag[attr].strip()
-
-    except Exception as e:
-        logger.debug("Site description scrape error for %s: %s", paper_url, e)
     return ""
 
 
@@ -910,35 +904,16 @@ def _scrape_description_from_site(paper_url):
     return _shorten_scraped_description(_scrape_raw_from_site(paper_url))
 
 
-
 def _generate_description_from_poster(image_path):
-    if not API_KEY_CONFIGURED or _openai_client is None:
-        return ""
     try:
-        from bot_engine.prompts import DESCRIPTION_FROM_POSTER_PROMPT
-        data_url = _encode_image_to_base64(image_path)
-        response = _openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": DESCRIPTION_FROM_POSTER_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                ],
-            }],
-            max_tokens=300,
-            temperature=0.3,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.warning("Poster image summary fallback failed: %s", e)
+        request_kwargs = _vision_request(DESCRIPTION_FROM_POSTER_PROMPT, image_path, 300, 0.3)
+    except OSError as e:
+        logger.warning("Poster image unreadable at %s: %s", image_path, e)
         return ""
+    return _complete(request_kwargs, "summary from poster") or ""
 
 
 def generate_why_useful(summary="", user_notes="", user_tags="", research_interests=""):
-    if not API_KEY_CONFIGURED or _openai_client is None:
-        return ""
-
     sections = (
         ("Research group interests", research_interests),
         ("Abstract/summary",         summary),
@@ -948,21 +923,10 @@ def generate_why_useful(summary="", user_notes="", user_tags="", research_intere
     parts = [f"{label}:\n{value.strip()}" for label, value in sections if value and value.strip()]
     if not parts:
         return ""
-
-    try:
-        response = _openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": WHY_USEFUL_PROMPT},
-                {"role": "user",   "content": "\n\n".join(parts)},
-            ],
-            max_tokens=150,
-            temperature=0.3,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.warning("GPT why-useful generation failed: %s", e)
-        return ""
+    return _complete(
+        _text_request(WHY_USEFUL_PROMPT, "\n\n".join(parts), 150, 0.3),
+        "why-useful generation",
+    ) or ""
 
 
 def _resolve_year(ai_year, paper_result, paper_link):
@@ -971,7 +935,7 @@ def _resolve_year(ai_year, paper_result, paper_link):
 
     if paper_result and paper_result.get("year"):
         return paper_result["year"]
-    
+
     if paper_link:
         arxiv_match = re.search(r'arxiv\.org/(?:abs|pdf)/(\d{2})\d{2}\.\d+', paper_link, re.I)
         if arxiv_match:
@@ -980,7 +944,39 @@ def _resolve_year(ai_year, paper_result, paper_link):
     return ""
 
 
+def _unique_authors(raw):
+    seen, unique = set(), []
+    for author in (a.strip() for a in (raw or "").split(",") if a.strip()):
+        key = author.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(author)
+    return ", ".join(unique)
+
+
+def _empty_poster_result():
+    return {
+        "is_research_poster": False,
+        "title":       "",
+        "authors":     "",
+        "summary":     "",
+        "subfields":   "",
+        "paper_link":  "",
+        "github_link": "",
+        "publication_year": "",
+        "notes":       "",
+    }
+
+
 def analyze_and_enrich(image_path, overrides=None):
+    _clear_pdf_cache()
+    try:
+        return _analyze_and_enrich(image_path, overrides)
+    finally:
+        _clear_pdf_cache()
+
+
+def _analyze_and_enrich(image_path, overrides):
     overrides = overrides or {}
     info = extract_poster_info(image_path)
 
@@ -989,17 +985,7 @@ def analyze_and_enrich(image_path, overrides=None):
 
     if not info.get("is_research_poster"):
         logger.info("Image is not a research poster, skipping enrichment.")
-        return {
-            "is_research_poster": False,
-            "title":       "",
-            "authors":     "",
-            "summary":     "",
-            "subfields":   "",
-            "paper_link":  "",
-            "github_link": "",
-            "publication_year": "",
-            "notes":       "",
-        }
+        return _empty_poster_result()
 
     title        = info.get("title", "")
     search_query = info.get("search_query", "")
@@ -1008,10 +994,9 @@ def analyze_and_enrich(image_path, overrides=None):
 
     paper_result = None
     if not user_paper_link:
-        paper_result = search_paper(search_query)
-        if not paper_result and title and title != search_query:
-            logger.debug("Retrying search with full title: %s", title)
-            paper_result = search_paper(title)
+        paper_result = search_paper(
+            title, query_hint=search_query, arxiv_id=info.get("arxiv_id", ""),
+        )
 
     paper_link        = user_paper_link
     pdf_url_hint      = ""
@@ -1033,26 +1018,38 @@ def analyze_and_enrich(image_path, overrides=None):
         title=title,
     )
 
-    github_url = find_github_repo(
+    if not paper_link and pdf_url:
+        identifier = _arxiv_id(pdf_url)
+        paper_link = f"https://arxiv.org/abs/{identifier}" if identifier else pdf_url
+        logger.info("Recovered paper link from PDF fallback: %s", paper_link)
+
+    github_url = overrides.get("github_link", "") or find_github_repo(
         pdf_url=pdf_url,
         title=title,
         github_query=info.get("github_query", ""),
         paper_url=paper_link,
         doi=doi,
-    ) or overrides.get("github_link", "")
+    )
 
-    gpt_authors = info.get("authors", "")
-    if not gpt_authors and paper_link:
-        gpt_authors = fetch_authors(paper_link, title=title) or authors_from_api
-    authors_raw = gpt_authors
-    seen = set()
-    unique = []
-    for a in (x.strip() for x in authors_raw.split(",") if x.strip()):
-        key = a.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(a)
-    authors = ", ".join(unique)
+    if not paper_link and github_url:
+        paper_result = find_paper_from_github(github_url, title)
+        if paper_result:
+            paper_link = paper_result["paper_url"]
+            pdf_url = paper_result.get("pdf_url", "")
+            doi = paper_result.get("doi", "")
+            authors_from_api = paper_result.get("authors", "")
+            abstract_from_api = paper_result.get("abstract", "")
+
+    authors_raw = authors_from_api
+    authors_source = "paper_metadata" if authors_raw else ""
+    if not authors_raw and paper_link:
+        authors_raw = fetch_authors(paper_link, title=title)
+        if authors_raw:
+            authors_source = "linked_paper"
+    if not authors_raw:
+        authors_raw = info.get("authors", "") or ""
+        authors_source = "poster_image"
+    logger.info("Author resolution for %r: source=%s", title, authors_source)
 
     description_fns = (
         lambda: _generate_description_from_pdf(pdf_url) if pdf_url else "",
@@ -1068,10 +1065,13 @@ def analyze_and_enrich(image_path, overrides=None):
         if description:
             break
 
+    logger.info("Enrichment complete for %r: paper=%s pdf=%s github=%s summary=%s",
+                title, paper_link or "not_found", pdf_url or "not_found",
+                github_url or "not_found", bool(description))
     return {
         "is_research_poster": info.get("is_research_poster", True),
         "title":       info.get("title", "Untitled"),
-        "authors":     authors,
+        "authors":     _unique_authors(authors_raw),
         "summary":     description,
         "subfields":   _parse_subfields(info.get("subfields", [])),
         "paper_link":  paper_link,

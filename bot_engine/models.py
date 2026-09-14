@@ -6,8 +6,9 @@ import logging
 import os
 
 from django.conf import settings
+from django.core.exceptions import SuspiciousFileOperation
 from django.core.files.base import ContentFile
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
@@ -267,22 +268,22 @@ class ResearchPoster(models.Model):
         finally:
             try:
                 self.image.close()
-            except Exception:
-                pass
+            except (OSError, ValueError) as e:
+                logger.warning("Could not close image for poster %s: %s", self.pk, type(e).__name__)
 
     def generate_thumbnail(self, max_size=300, quality=80, save=False):
         if not self.image:
             return
+        from PIL import Image, UnidentifiedImageError
         try:
-            from PIL import Image
             with self._open_image() as f, Image.open(f) as img:
                 img.thumbnail((max_size, max_size), Image.LANCZOS)
                 buf = io.BytesIO()
                 img.convert("RGB").save(buf, format="JPEG", quality=quality)
                 thumb_name = f"thumb_{os.path.splitext(os.path.basename(self.image.name))[0]}.jpg"
                 self.thumbnail.save(thumb_name, ContentFile(buf.getvalue()), save=save)
-        except Exception as e:
-            logger.warning("Thumbnail generation failed for poster %s: %s", self.pk, e)
+        except (UnidentifiedImageError, SuspiciousFileOperation, OSError, ValueError) as e:
+            logger.warning("Thumbnail generation failed for poster %s: %s", self.pk, type(e).__name__)
 
     @property
     def thumbnail_url(self):
@@ -469,11 +470,14 @@ class UserGroupMembership(models.Model):
         return f"{self.user} -> {self.group}{primary}"
 
     def save(self, *args, **kwargs):
-        if self.is_primary:
+        if not self.is_primary:
+            super().save(*args, **kwargs)
+            return
+        with transaction.atomic():
             UserGroupMembership.objects.filter(
                 user=self.user, is_primary=True,
             ).exclude(pk=self.pk).update(is_primary=False)
-        super().save(*args, **kwargs)
+            super().save(*args, **kwargs)
 
 
 class PosterGroupWhyUseful(models.Model):

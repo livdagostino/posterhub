@@ -37,7 +37,6 @@ urlpatterns = [
     path("export/approved/csv/",  views.export_approved_csv,  name="export_approved_csv"),
     path("export/approved/json/", views.export_approved_json, name="export_approved_json"),
 
-    # Group management
     path("groups/",                                          views.group_list,          name="group_list"),
     path("groups/create/",                                   views.group_create,        name="group_create"),
     path("groups/<int:group_id>/edit/",                      views.group_edit,          name="group_edit"),

@@ -1,13 +1,15 @@
 import io
 import json
 import logging
+import os
 import re
+import threading
 from urllib.parse import urlparse
 
 import pypdf
 import requests
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from django.conf import settings
 from django.core.cache import cache
 
@@ -23,7 +25,18 @@ HEADERS = {
 }
 
 _openai_key = getattr(settings, "OPENAI_API_KEY", None) or ""
-_client = OpenAI(api_key=_openai_key) if _openai_key.strip() else None
+OPENAI_CONFIGURED = bool(_openai_key.strip())
+_openai_state = threading.local()
+
+
+def _client():
+    if not OPENAI_CONFIGURED:
+        return None
+    pid = os.getpid()
+    if getattr(_openai_state, "pid", None) != pid:
+        _openai_state.client = OpenAI(api_key=_openai_key)
+        _openai_state.pid = pid
+    return _openai_state.client
 
 _gcs_api_key = getattr(settings, "GOOGLE_CSE_API_KEY", None) or ""
 _gcs_cx = getattr(settings, "GOOGLE_CSE_CX", None) or ""
@@ -160,8 +173,8 @@ def _google_cse(query, limit=5):
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception as e:
-        logger.warning("Google CSE failed: %s", e)
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("Google CSE failed: %s", type(e).__name__)
         return []
     return [
         {"url": item["link"], "title": item.get("title", "")}
@@ -197,30 +210,84 @@ def _get_texts_from_source(url, stype):
     return texts
 
 
+MAX_PDF_BYTES = 50 * 1024 * 1024
+MAX_HTML_BYTES = 8 * 1024 * 1024
+MAX_PDF_TEXT_CHARS = 300_000
+PDF_TIMEOUT = (5, 30)
+HTML_TIMEOUT = (5, 15)
+
+
+def _read_capped(response, limit):
+    body = bytearray()
+    for chunk in response.iter_content(65536):
+        body.extend(chunk)
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
+def _download_capped(url, limit, timeout, accepted_types):
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=timeout, stream=True)
+    except requests.RequestException as e:
+        logger.warning("Download failed %s: %s", url, type(e).__name__)
+        return None, ""
+    try:
+        if response.status_code != 200:
+            logger.warning("Download returned HTTP %s: %s", response.status_code, url)
+            return None, ""
+        content_type = response.headers.get("Content-Type", "")
+        if not any(kind in content_type for kind in accepted_types):
+            return None, content_type
+        declared = response.headers.get("Content-Length", "")
+        if declared.isdigit() and int(declared) > limit:
+            logger.warning("Download exceeds size limit: %s", url)
+            return None, content_type
+        body = _read_capped(response, limit)
+        if body is None:
+            logger.warning("Download exceeds size limit: %s", url)
+            return None, content_type
+        return body, content_type
+    except requests.RequestException as e:
+        logger.warning("Download interrupted %s: %s", url, type(e).__name__)
+        return None, ""
+    finally:
+        response.close()
+
+
 def _download_pdf(url):
     cache_key = f"conf:pdf:{_norm(url)}"
     cached = cache.get(cache_key)
     if cached:
         return cached
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30, stream=True)
-        resp.raise_for_status()
-        ct = resp.headers.get("Content-Type", "")
-        if "pdf" not in ct and not url.lower().endswith(".pdf"):
-            return None
-        if len(resp.content) > 50 * 1024 * 1024:
-            return None
-
-        reader = pypdf.PdfReader(io.BytesIO(resp.content))
-        pages = [p.extract_text() for p in reader.pages if p.extract_text()]
-        full = "\n".join(pages)[:300_000]
-
-        cache.set(cache_key, full, timeout=CACHE_TTL)
-        return full
-    except Exception as e:
-        logger.warning("PDF failed %s: %s", url, e)
+    accepted = ("",) if url.lower().endswith(".pdf") else ("pdf",)
+    body, _ = _download_capped(url, MAX_PDF_BYTES, PDF_TIMEOUT, accepted)
+    if body is None:
         return None
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(body))
+        pages = []
+        length = 0
+        for page in reader.pages:
+            try:
+                extracted = page.extract_text()
+            except (pypdf.errors.PyPdfError, ValueError, TypeError, KeyError, RecursionError):
+                continue
+            if not extracted:
+                continue
+            pages.append(extracted)
+            length += len(extracted)
+            if length >= MAX_PDF_TEXT_CHARS:
+                break
+    except (pypdf.errors.PyPdfError, ValueError, OSError, RecursionError) as e:
+        logger.warning("Unreadable PDF %s: %s", url, type(e).__name__)
+        return None
+
+    full = "\n".join(pages)[:MAX_PDF_TEXT_CHARS]
+    cache.set(cache_key, full, timeout=CACHE_TTL)
+    return full
 
 
 def _download_html(url):
@@ -229,17 +296,13 @@ def _download_html(url):
     if cached:
         return cached
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        ct = resp.headers.get("Content-Type", "")
-        if "html" not in ct and "text" not in ct:
-            return None
-        cache.set(cache_key, resp.text, timeout=CACHE_TTL)
-        return resp.text
-    except Exception as e:
-        logger.warning("HTML failed %s: %s", url, e)
+    body, _ = _download_capped(url, MAX_HTML_BYTES, HTML_TIMEOUT, ("html", "text"))
+    if body is None:
         return None
+
+    html = body.decode("utf-8", errors="replace")
+    cache.set(cache_key, html, timeout=CACHE_TTL)
+    return html
 
 
 def _extract_html_text(html):
@@ -288,9 +351,10 @@ def _resolve_url(href, base_url):
 
 def _url_reachable(url):
     try:
-        r = requests.head(url, headers=HEADERS, timeout=5, allow_redirects=True)
-        return r.status_code == 200
-    except Exception:
+        return requests.head(
+            url, headers=HEADERS, timeout=(5, 5), allow_redirects=True
+        ).status_code == 200
+    except requests.RequestException:
         return False
 
 
@@ -367,7 +431,7 @@ def _parse_cvf_fulltext(soup):
 
 
 def _llm_json(system_prompt, user_content, max_tokens, temperature):
-    resp = _client.chat.completions.create(
+    resp = _client().chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -383,7 +447,7 @@ def _llm_json(system_prompt, user_content, max_tokens, temperature):
 
 
 def _llm_extract(text, paper_title, conf_label, year, day=""):
-    if not _client:
+    if not _client():
         return None
 
     if len(text) > 120_000:
@@ -401,8 +465,8 @@ def _llm_extract(text, paper_title, conf_label, year, day=""):
             max_tokens=500,
             temperature=0.1,
         )
-    except Exception as e:
-        logger.warning("LLM extract failed: %s", e)
+    except (OpenAIError, ValueError, TypeError, AttributeError, IndexError) as e:
+        logger.warning("LLM extract failed: %s", type(e).__name__)
         return None
 
     if not data.get("found"):
@@ -427,7 +491,7 @@ def _llm_extract(text, paper_title, conf_label, year, day=""):
 
 
 def _llm_similar(text, paper_title, tags, conf_label, year):
-    if not _client or not tags:
+    if not _client() or not tags:
         return []
 
     if len(text) > 80_000:
@@ -445,8 +509,8 @@ def _llm_similar(text, paper_title, tags, conf_label, year):
             max_tokens=2000,
             temperature=0.2,
         )
-    except Exception as e:
-        logger.warning("LLM similar failed: %s", e)
+    except (OpenAIError, ValueError, TypeError, AttributeError, IndexError) as e:
+        logger.warning("LLM similar failed: %s", type(e).__name__)
         return []
 
     if not isinstance(data, list):

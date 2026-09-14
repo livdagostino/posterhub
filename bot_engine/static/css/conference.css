@@ -541,6 +541,7 @@
 
 .conf-nav-links {
     display: flex;
+    flex-wrap: wrap;
     justify-content: center;
     gap: 16px;
     margin-top: 28px;
@@ -568,9 +569,6 @@
 @keyframes confSpin {
     to { transform: rotate(360deg); }
 }
-
-
-/* ── Responsive ── */
 
 @media (max-width: 768px) {
     .conf-user-bar {

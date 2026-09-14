@@ -7,18 +7,24 @@
 <div class="container dashboard">
     <div class="mg-container">
 
-        <div style="margin-bottom: 10px;">
+        <div style="margin-bottom:10px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
             <a href="{% url back_target %}" class="nav-link" style="display:inline-flex;align-items:center;gap:6px;font-size:0.86em;">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
                 Back to {% if back_target == 'upload' %}Upload{% elif back_target == 'conference' %}Conference{% else %}Dashboard{% endif %}
             </a>
+            {% include '_management_links.html' %}
         </div>
 
         <div class="mg-header">
             <h1>My Research Groups</h1>
             <p class="mg-intro">
                 These are the groups you belong to. Your <strong>primary group</strong> (&#9733;) is used by default when generating the &laquo;Why useful&raquo; explanation for a paper.
-                You can change your primary group anytime. To join another group, contact an admin.
+                You can change your primary group anytime.
+                {% if is_group_manager %}
+                    Use <a href="{% url 'group_list' %}">Manage Groups</a> to create groups, manage members and edit research interests.
+                {% else %}
+                    To join another group, contact an admin.
+                {% endif %}
             </p>
         </div>
 
@@ -44,7 +50,10 @@
                     {% endif %}
                 {% endwith %}
             </div>
-            <div>
+            <div style="display:flex;flex-direction:column;align-items:flex-start;gap:8px;">
+                {% if is_group_manager %}
+                    <a href="{% url 'group_edit' m.group.pk %}" class="mg-btn" style="text-decoration:none;">Edit group &amp; interests</a>
+                {% endif %}
                 {% if m.is_primary %}
                     <span style="font-size:0.82em; color:var(--text-faint);">Already primary</span>
                 {% else %}
@@ -56,7 +65,12 @@
         </div>
         {% empty %}
         <div class="mg-empty">
-            You are not a member of any research group yet. Ask an admin to add you to one.
+            You are not a member of any research group yet.
+            {% if is_group_manager %}
+                Use <a href="{% url 'group_list' %}">Manage Groups</a> to create a group or add yourself to an existing one.
+            {% else %}
+                Ask an admin to add you to one.
+            {% endif %}
         </div>
         {% endfor %}
 

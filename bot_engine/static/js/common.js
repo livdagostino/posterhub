@@ -144,9 +144,14 @@ function showToast(message, type) {
     var toast = document.createElement('div');
     toast.className = 'toast toast-' + type;
     toast.id = 'toast';
-    toast.innerHTML =
-        '<span class="toast-icon">' + (icons[type] || icons.info) + '</span>' +
-        '<span class="toast-message">' + message + '</span>';
+    var icon = document.createElement('span');
+    icon.className = 'toast-icon';
+    icon.textContent = icons[type] || icons.info;
+    var text = document.createElement('span');
+    text.className = 'toast-message';
+    text.textContent = message;
+    toast.appendChild(icon);
+    toast.appendChild(text);
 
     document.body.appendChild(toast);
 

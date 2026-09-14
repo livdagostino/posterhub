@@ -157,7 +157,8 @@ function renderPreviews() {
             previewImg.style.display = 'none';
             var placeholder = document.createElement('div');
             placeholder.className = 'heic-placeholder';
-            placeholder.innerHTML = '<span class="heic-placeholder-icon">🖼</span><span class="heic-placeholder-name">' + file.name + '</span><span>HEIC preview not available in browser</span>';
+            placeholder.innerHTML = '<span class="heic-placeholder-icon">🖼</span><span class="heic-placeholder-name"></span><span>HEIC preview not available in browser</span>';
+            placeholder.querySelector('.heic-placeholder-name').textContent = file.name;
             dropPreview.insertBefore(placeholder, dropPreview.firstChild);
         } else {
             previewImg.style.display = '';

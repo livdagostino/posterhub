@@ -27,7 +27,8 @@ A Django web application for building a searchable, AI-powered library of scient
 - **Group editor on paper detail**: pencil button next to the Groups badges opens an inline panel with the user's groups; toggles only the user's memberships and preserves any other group's link to the paper
 - **Mine** filter: dashboard pill that scopes the table and the donut to papers the current user uploaded
 - **Group management UI** (`/groups/`, group-manager or admin): create/edit/delete groups, add/remove members, set primary, and a "users awaiting group assignment" panel with one-click add-to-group plus a **Skip** action that suppresses the alert for users you do not want to assign
-- **My Groups** page (`/my-groups/`): each user can pick which of their groups is primary
+- **My Groups** page (`/my-groups/`): each user can pick which of their groups is primary; group managers and admins can also open group and research-interest editing directly
+- **Manage Groups** is available to group managers and admins from Upload, Dashboard, Conference and My Groups, including when they have no research-group membership. **Users** remains admin-only
 
 ### Access Control & Roles
 
@@ -53,13 +54,30 @@ From a single poster image the system extracts:
 
 | Step | Source | Purpose |
 |------|--------|---------|
-| 1 | Semantic Scholar API | Paper link, open-access PDF, arXiv ID, DOI, authors |
-| 2 | Google Scholar (fallback) | Scraping-based search when Semantic Scholar is unavailable |
-| 3 | Paper page / DOI scraping | Visits the paper page and follows DOI redirects to find the real PDF |
-| 4 | arXiv API | Title-based search as last-resort PDF source |
-| 5 | PDF annotation extraction | Reads clickable hyperlink annotations embedded in the PDF |
-| 6 | PDF text extraction | Finds `github.com` links in extracted text |
-| 7 | GitHub API | Multi-strategy repository search with word-overlap validation |
+| 1 | Visible arXiv ID and arXiv title search | Verified paper page, PDF, authors, abstract and year; title/acronym queries also handle different poster subtitles |
+| 2 | arXiv web search | Independent fallback when the export API cannot supply a matching paper |
+| 3 | Semantic Scholar, then Google Scholar | Additional sources, bounded retries, explicit HTTP/challenge logging, and title validation |
+| 4 | Paper page / DOI / PDF search | Locate a usable PDF; recover the paper link from a PDF-only match |
+| 5 | PDF annotations, PDF text, paper page, GitHub API | Find the code repository |
+| 6 | Located GitHub project | Recover a missing paper from arXiv references, validating the referenced title |
+
+arXiv metadata is cached (successful queries for 24 hours, empty results for five
+minutes), with shared request spacing. Provider outages are not cached as missing
+papers; a short cooldown lets other sources continue. Manual links survive
+consecutive retries, and temporary lookup failures do not erase known links.
+External sources can still be unavailable; logs distinguish HTTP failures from
+searches that return no matching paper.
+
+To preview recovery for specific existing records without rerunning AI or sending
+bot messages, then apply only the missing verified links:
+
+```bash
+docker compose exec django python manage.py repair_paper_links 157 158
+docker compose exec django python manage.py repair_paper_links 157 158 --apply
+```
+
+The command preserves existing links, summaries, notes, groups and validation
+status, and skips records whose analysis is currently running.
 
 ### Dashboard
 - Full table view: title, authors, category, tags, paper link, GitHub link, summary, notes
@@ -355,3 +373,20 @@ docker compose up --build -d
 - Redis locks prevent duplicate processing of the same poster across workers
 - Celery Beat schedule is persisted in a Docker volume to survive container restarts
 - Error details are logged server-side only -- bot and web users receive generic error messages
+
+
+## Regression tests
+
+Run the group-management navigation and authorization checks with an isolated
+in-memory SQLite database and cache:
+
+```bash
+python manage.py test bot_engine --settings=tesi_project.test_settings --noinput
+```
+
+From the production Compose directory, run them in a temporary container with
+no network or production volumes:
+
+```bash
+docker run --rm --network none posterhub-django python manage.py test bot_engine --settings=tesi_project.test_settings --noinput
+```

@@ -20,9 +20,6 @@ lxml==6.0.2
 # PDF processing
 pypdf==5.1.0
 
-# GitHub API
-PyGithub==2.8.1
-
 # Immagini
 pillow==12.1.1
 pillow-heif==0.21.0

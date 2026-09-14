@@ -4,11 +4,10 @@ import uuid
 from contextlib import contextmanager
 
 import redis
-import requests
 from celery import shared_task
 from django.conf import settings
 from django.core.cache import cache
-from django.db import close_old_connections
+from django.db import DatabaseError, close_old_connections
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +16,8 @@ STALE_PROCESSING_SECONDS = 600
 BOT_MESSAGE_TTL = 86400
 BOT_CONTEXT_TTL = 86400
 BOT_STATE_TTL = 7200
+LOCK_BUSY_RETRY_SECONDS = 30
+STALE_LOCK_RETRY_SECONDS = 5
 
 _UNLOCK_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -27,15 +28,18 @@ end
 """
 
 _redis_client = None
+_redis_client_pid = None
 
 
 def _get_redis_client():
-    global _redis_client
-    if _redis_client is None:
+    global _redis_client, _redis_client_pid
+    pid = os.getpid()
+    if _redis_client is None or _redis_client_pid != pid:
         redis_url = os.environ.get("REDIS_CACHE_URL") or getattr(
             settings, "CELERY_BROKER_URL", "redis://redis:6379/0"
         )
         _redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+        _redis_client_pid = pid
     return _redis_client
 
 
@@ -54,124 +58,101 @@ def _acquire_poster_lock(poster_id):
 def _release_poster_lock(client, key, token):
     try:
         client.eval(_UNLOCK_SCRIPT, 1, key, token)
-    except Exception as e:
-        logger.warning("Could not release lock %s: %s", key, e)
+    except redis.RedisError as e:
+        logger.warning("Could not release lock %s: %s", key, type(e).__name__)
+
+
+def _get_poster(poster_id):
+    from bot_engine.models import ResearchPoster
+
+    return ResearchPoster.objects.filter(pk=poster_id).first()
+
+
+def _resolve_poster(new_poster, poster_id):
+    resolved = new_poster or _get_poster(poster_id)
+    return resolved, (resolved.pk if resolved else poster_id)
 
 
 def _is_stale_processing(poster_id):
-    try:
-        from bot_engine.models import ResearchPoster
-        from django.utils import timezone
+    from django.utils import timezone
 
-        poster = ResearchPoster.objects.filter(pk=poster_id, analysis_status="processing").first()
-        if not poster:
-            return False
-        return (timezone.now() - poster.updated_at).total_seconds() > STALE_PROCESSING_SECONDS
-    except Exception:
+    try:
+        poster = _get_poster(poster_id)
+    except DatabaseError as e:
+        logger.warning("Stale-processing check failed for poster %s: %s", poster_id, type(e).__name__)
         return False
+    if not poster or poster.analysis_status != "processing":
+        return False
+    return (timezone.now() - poster.updated_at).total_seconds() > STALE_PROCESSING_SECONDS
 
 
 def _force_break_lock(poster_id):
     try:
         _get_redis_client().delete(_lock_key(poster_id))
         logger.info("Force-broke stale lock for poster_id=%s", poster_id)
-    except Exception as e:
-        logger.warning("Could not force-break lock for poster_id=%s: %s", poster_id, e)
+    except redis.RedisError as e:
+        logger.warning("Could not force-break lock for poster_id=%s: %s", poster_id, type(e).__name__)
 
 
 def _mark_poster_processing(poster_id):
     try:
-        from bot_engine.models import ResearchPoster
-
-        poster = ResearchPoster.objects.filter(pk=poster_id).first()
+        poster = _get_poster(poster_id)
         if not poster:
             return None
-        if getattr(poster, "analysis_status", None) != "processing":
+        if poster.analysis_status != "processing":
             poster.analysis_status = "processing"
             poster.save(update_fields=["analysis_status", "updated_at"])
         return poster
-    except Exception as e:
-        logger.warning("_mark_poster_processing error for poster %s: %s", poster_id, e)
+    except DatabaseError as e:
+        logger.warning("Could not mark poster %s as processing: %s", poster_id, type(e).__name__)
         return None
 
 
 def _mark_poster_failed(poster_id, title_fallback="Analysis Failed"):
     try:
-        from bot_engine.models import ResearchPoster
-
-        p = ResearchPoster.objects.filter(pk=poster_id).first()
-        if not p:
+        poster = _get_poster(poster_id)
+        if not poster:
             return
-        p.analysis_status = "failed"
-        if getattr(p, "title", "") in ("Pending analysis…", "", None):
-            p.title = title_fallback
-        p.save(update_fields=["title", "analysis_status", "updated_at"])
-    except Exception as e:
-        logger.warning("_mark_poster_failed error for poster %s: %s", poster_id, e)
+        poster.analysis_status = "failed"
+        if poster.title in ("Pending analysis…", "", None):
+            poster.title = title_fallback
+        poster.save(update_fields=["title", "analysis_status", "updated_at"])
+    except DatabaseError as e:
+        logger.warning("Could not mark poster %s as failed: %s", poster_id, type(e).__name__)
 
 
 def _delete_temp_poster(poster_id, log_prefix):
     try:
-        from bot_engine.models import ResearchPoster
-
-        p = ResearchPoster.objects.filter(pk=poster_id).first()
-        if not p:
-            return
+        poster = _get_poster(poster_id)
+    except DatabaseError as e:
+        logger.warning("[%s] Could not load poster %s: %s", log_prefix, poster_id, type(e).__name__)
+        return
+    if not poster:
+        return
+    if poster.image:
         try:
-            if p.image:
-                p.image.delete(save=False)
-        except Exception as e:
-            logger.warning("[%s] Could not delete image for poster %s: %s", log_prefix, poster_id, e)
-        try:
-            p.delete()
-        except Exception as e:
-            logger.warning("[%s] Could not delete poster %s: %s", log_prefix, poster_id, e)
-    except Exception as e:
-        logger.warning("[%s] _delete_temp_poster failed for %s: %s", log_prefix, poster_id, e)
+            poster.image.delete(save=False)
+        except (OSError, ValueError) as e:
+            logger.warning("[%s] Could not delete image for poster %s: %s",
+                           log_prefix, poster_id, type(e).__name__)
+    try:
+        poster.delete()
+    except DatabaseError as e:
+        logger.warning("[%s] Could not delete poster %s: %s", log_prefix, poster_id, type(e).__name__)
 
 
 def _send_failed_with_retry(platform, recipient, poster_id):
-    from bot_engine.views import send_message, send_telegram_buttons, MESSAGE_TEMPLATES
+    from bot_engine.views import MESSAGE_TEMPLATES, send_buttons, send_message
 
     text = MESSAGE_TEMPLATES["analysis_failed"][platform]
-
-    if platform == "telegram":
-        send_telegram_buttons(
-            recipient,
-            text,
-            [{"text": "🔄 Retry Analysis", "callback_data": f"retry_{poster_id}"}],
-        )
-        return
-
-    if platform == "whatsapp":
-        try:
-            response = requests.post(
-                f"https://graph.facebook.com/v21.0/{settings.WHATSAPP_PHONE_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {settings.WHATSAPP_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": recipient,
-                    "type": "interactive",
-                    "interactive": {
-                        "type": "button",
-                        "body": {"text": text},
-                        "action": {"buttons": [{
-                            "type": "reply",
-                            "reply": {"id": f"retry_{poster_id}", "title": "🔄 Retry"},
-                        }]},
-                    },
-                },
-                timeout=8,
-            )
-            response.raise_for_status()
-            return
-        except Exception as e:
-            logger.warning("WhatsApp retry button send failed: %s", e)
-
-    send_message(platform, recipient, text)
+    sent = send_buttons(
+        platform,
+        recipient,
+        text,
+        [{"id": f"retry_{poster_id}", "title": "🔄 Retry", "text": "🔄 Retry Analysis"}],
+    )
+    if not sent and platform == "whatsapp":
+        send_message(platform, recipient, text)
 
 
 def _send_failed_with_retry_once(platform, recipient, poster_id):
@@ -194,18 +175,19 @@ def _send_success_once(platform, recipient, poster):
 
 
 def _clear_bot_ratelimit(platform, recipient):
+    from bot_engine.views import _clear_ratelimit
+
     try:
-        from bot_engine.views import _clear_ratelimit
         _clear_ratelimit(platform, recipient)
-    except Exception as e:
-        logger.warning("_clear_ratelimit failed for %s/%s: %s", platform, recipient, e)
+    except redis.RedisError as e:
+        logger.warning("Could not clear rate limit for %s/%s: %s", platform, recipient, type(e).__name__)
 
 
 @contextmanager
 def _poster_lock(poster_id, log_prefix):
     try:
         client, key, token, acquired = _acquire_poster_lock(poster_id)
-    except Exception:
+    except redis.RedisError:
         logger.exception("[%s] Could not acquire Redis lock for poster_id=%s", log_prefix, poster_id)
         raise
     try:
@@ -221,7 +203,7 @@ def _handle_busy_lock(self, poster_id, log_prefix, on_exhausted):
         logger.warning("[%s] poster_id=%s stale processing detected, breaking lock", log_prefix, poster_id)
         _force_break_lock(poster_id)
         close_old_connections()
-        raise self.retry(countdown=5)
+        raise self.retry(countdown=STALE_LOCK_RETRY_SECONDS)
     if self.request.retries >= self.max_retries:
         logger.error("[%s] poster_id=%s lock retries exhausted, marking failed", log_prefix, poster_id)
         _mark_poster_failed(poster_id)
@@ -231,7 +213,13 @@ def _handle_busy_lock(self, poster_id, log_prefix, on_exhausted):
     logger.info("[%s] poster_id=%s lock held, retrying later (attempt %d/%d)",
                 log_prefix, poster_id, self.request.retries, self.max_retries)
     close_old_connections()
-    raise self.retry(countdown=30)
+    raise self.retry(countdown=LOCK_BUSY_RETRY_SECONDS)
+
+
+def _lookup_user(user_id):
+    from django.contrib.auth import get_user_model
+
+    return get_user_model().objects.filter(pk=user_id).first() if user_id else None
 
 
 @shared_task(bind=True, max_retries=5, default_retry_delay=15, acks_late=True, reject_on_worker_lost=True)
@@ -243,12 +231,9 @@ def process_poster_task(self, poster_id, user_notes=None, user_tags=None, source
             return _handle_busy_lock(self, poster_id, "Task:web", on_exhausted=lambda: None)
 
         try:
-            from bot_engine.models import ResearchPoster
             from bot_engine.views import process_uploaded_poster
-            from django.contrib.auth import get_user_model
 
-            User = get_user_model()
-            activity_user = User.objects.filter(pk=user_id).first() if user_id else None
+            activity_user = _lookup_user(user_id)
 
             logger.info("[Task:web] Starting analysis poster_id=%d source=%s", poster_id, source)
 
@@ -281,8 +266,7 @@ def process_poster_task(self, poster_id, user_notes=None, user_tags=None, source
                 return {"poster_id": poster_id, "status": "duplicate", "duplicate_id": dup_id}
 
             if error == "analysis_failed":
-                resolved = new_poster or ResearchPoster.objects.filter(pk=poster_id).first()
-                resolved_id = resolved.pk if resolved else poster_id
+                _, resolved_id = _resolve_poster(new_poster, poster_id)
                 _mark_poster_failed(resolved_id)
                 logger.warning("[Task:web] poster_id=%d -> analysis_failed, kept in DB", poster_id)
                 return {"poster_id": resolved_id, "status": "analysis_failed"}
@@ -292,9 +276,8 @@ def process_poster_task(self, poster_id, user_notes=None, user_tags=None, source
                 logger.warning("[Task:web] poster_id=%d -> AI failed, deleted: %s", poster_id, error)
                 return {"poster_id": poster_id, "status": "error"}
 
-            resolved = new_poster or ResearchPoster.objects.filter(pk=poster_id).first()
+            resolved, resolved_id = _resolve_poster(new_poster, poster_id)
             resolved_title = resolved.title if resolved else ""
-            resolved_id = resolved.pk if resolved else poster_id
             logger.info("[Task:web] Completed poster_id=%d title='%s'", resolved_id, resolved_title)
             return {"poster_id": resolved_id, "title": resolved_title, "status": "done"}
 
@@ -328,11 +311,8 @@ def download_and_handle_media_task(self, platform, recipient, media_id, filename
         logger.error("[Task:media] %s %s/%s: %s", platform, recipient, media_id, exc)
         if self.request.retries < self.max_retries:
             raise self.retry(exc=exc)
-        try:
-            from bot_engine.views import send_message
-            send_message(platform, recipient, "❌ Error processing your image. Please try again.")
-        except Exception:
-            pass
+        from bot_engine.views import send_message
+        send_message(platform, recipient, "❌ Error processing your image. Please try again.")
     finally:
         close_old_connections()
 
@@ -352,13 +332,12 @@ def process_bot_poster_task(self, platform, recipient, poster_id, notes=None, ta
             return _handle_busy_lock(self, poster_id, "Task:bot", on_exhausted=_bot_cleanup)
 
         try:
-            from bot_engine.models import ResearchPoster, UserGroupMembership
+            from bot_engine.models import UserGroupMembership
             from bot_engine.views import (
                 process_uploaded_poster,
                 send_message,
                 MESSAGE_TEMPLATES,
             )
-            from django.contrib.auth import get_user_model
 
             logger.info("[Task:bot] Starting analysis poster_id=%d platform=%s", poster_id, platform)
 
@@ -368,8 +347,7 @@ def process_bot_poster_task(self, platform, recipient, poster_id, notes=None, ta
                 logger.error("[Task:bot] Poster %d not found in DB", poster_id)
                 return {"error": "poster not found"}
 
-            User = get_user_model()
-            activity_user = User.objects.filter(pk=user_id).first() if user_id else None
+            activity_user = _lookup_user(user_id)
             group_ids = []
             if activity_user:
                 primary_group_id = (
@@ -423,8 +401,7 @@ def process_bot_poster_task(self, platform, recipient, poster_id, notes=None, ta
                 return {"status": "duplicate", "poster_id": poster_id}
 
             if error == "analysis_failed":
-                resolved = new_poster or ResearchPoster.objects.filter(pk=poster_id).first()
-                resolved_id = resolved.pk if resolved else poster_id
+                _, resolved_id = _resolve_poster(new_poster, poster_id)
 
                 _mark_poster_failed(resolved_id)
                 _bot_cleanup()
@@ -444,7 +421,7 @@ def process_bot_poster_task(self, platform, recipient, poster_id, notes=None, ta
                 logger.warning("[Task:bot] poster_id=%d -> error: %s", poster_id, error)
                 return {"status": "error", "poster_id": poster_id}
 
-            resolved = new_poster or ResearchPoster.objects.filter(pk=poster_id).first()
+            resolved, _ = _resolve_poster(new_poster, poster_id)
             if not resolved:
                 _bot_cleanup()
                 logger.error("[Task:bot] Resolved poster missing after processing poster_id=%d", poster_id)
@@ -468,10 +445,7 @@ def process_bot_poster_task(self, platform, recipient, poster_id, notes=None, ta
             if self.request.retries >= self.max_retries:
                 _mark_poster_failed(poster_id)
                 cache.delete(cache_key)
-                try:
-                    _send_failed_with_retry_once(platform, recipient, poster_id)
-                except Exception as send_exc:
-                    logger.warning("[Task:bot] could not send final failure message: %s", send_exc)
+                _send_failed_with_retry_once(platform, recipient, poster_id)
                 return {"status": "analysis_failed", "poster_id": poster_id}
 
             raise self.retry(exc=exc)

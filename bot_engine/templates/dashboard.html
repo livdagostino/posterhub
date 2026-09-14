@@ -77,7 +77,7 @@
                         <path d="M23 21v-2a4 4 0 00-3-3.87"/>
                         <path d="M16 3.13a4 4 0 010 7.75"/>
                     </svg>
-                    Groups
+                    Manage Groups
                  </a>
                  {% endif %}
                  {% if is_superuser %}
@@ -322,7 +322,7 @@
             <div class="active-subfield-tags" id="activeSubfieldTags" style="margin-top:6px;">
                 {% if subfield_filter %}
                     {% for sf in subfield_filter %}
-                        <span class="subfield-active-tag">{{ sf }} <button onclick="removeSubfield('{{ sf }}')" class="subfield-tag-remove">&times;</button></span>
+                        <span class="subfield-active-tag">{{ sf }} <button onclick="removeSubfield('{{ sf|escapejs }}')" class="subfield-tag-remove">&times;</button></span>
                     {% endfor %}
                 {% endif %}
             </div>

@@ -1,9 +1,12 @@
 import csv
+import hashlib
+import hmac
 import io
 import json
 import logging
 import os
 import re
+from codecs import BOM_UTF8
 from functools import wraps
 
 import requests
@@ -22,6 +25,7 @@ from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.csrf import csrf_exempt
 
 try:
@@ -31,7 +35,10 @@ try:
 except ImportError:
     _HEIF_AVAILABLE = False
 
-from .access import is_group_manager, user_can_interact
+from .access import (
+    accessible_posters, can_access_group, get_accessible_poster_or_404,
+    is_group_manager, user_can_interact,
+)
 from .forms import PosterUploadForm, PosterEditForm
 from .models import (
     ResearchPoster, ActivityLog, Favorite,
@@ -44,8 +51,26 @@ from .tasks import process_poster_task, process_bot_poster_task, download_and_ha
 logger = logging.getLogger(__name__)
 
 
+def _is_ajax(request):
+    return request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+
+def _remove_poster_image(poster):
+    if not poster.image:
+        return
+    try:
+        path = poster.image.path
+    except (NotImplementedError, ValueError):
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError as e:
+        logger.warning("Could not remove image for poster %s: %s", poster.pk, type(e).__name__)
+
+
 def _forbidden(request, redirect_to="dashboard"):
-    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+    if _is_ajax(request):
         return JsonResponse({"error": "Forbidden"}, status=403)
     return redirect(redirect_to)
 
@@ -66,7 +91,7 @@ def _gate(predicate, on_fail=None):
 
 def _no_groups_response(request):
     msg = "Your account is not in any research group yet. Ask an administrator to add you before using this feature."
-    if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.method != "GET":
+    if _is_ajax(request) or request.method != "GET":
         return JsonResponse({"error": "no_groups", "message": msg}, status=403)
     messages.warning(request, msg)
     return redirect("dashboard")
@@ -208,19 +233,35 @@ def logout_view(request):
     return redirect("login")
 
 
+MEDIA_DOWNLOAD_TIMEOUT = (5, 20)
+MAX_BOT_MEDIA_BYTES = PosterUploadForm.MAX_UPLOAD_SIZE
+
+
+def _download_media_bytes(url, headers=None):
+    with requests.get(url, headers=headers, timeout=MEDIA_DOWNLOAD_TIMEOUT, stream=True) as response:
+        if response.status_code != 200:
+            logger.warning("Media download returned HTTP %s", response.status_code)
+            return None
+        body = bytearray()
+        for chunk in response.iter_content(65536):
+            body.extend(chunk)
+            if len(body) > MAX_BOT_MEDIA_BYTES:
+                logger.warning("Media download exceeds the %d byte limit", MAX_BOT_MEDIA_BYTES)
+                return None
+        return bytes(body)
+
+
 def download_telegram_file(file_id):
     try:
         info = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}",
-            timeout=10,
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+            params={"file_id": file_id},
+            timeout=MEDIA_DOWNLOAD_TIMEOUT,
         ).json()
         file_path = info["result"]["file_path"]
-        return requests.get(
-            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}",
-            timeout=10,
-        ).content
-    except Exception as e:
-        logger.warning("Telegram download failed for %s: %s", file_id, e)
+        return _download_media_bytes(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}")
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        logger.warning("Telegram download failed for %s: %s", file_id, type(e).__name__)
         return None
 
 
@@ -230,14 +271,14 @@ def download_whatsapp_media(media_id):
         info = requests.get(
             f"https://graph.facebook.com/v21.0/{media_id}",
             headers=headers,
-            timeout=10,
+            timeout=MEDIA_DOWNLOAD_TIMEOUT,
         ).json()
         media_url = info.get("url")
         if not media_url:
             return None
-        return requests.get(media_url, headers=headers, timeout=10).content
-    except Exception as e:
-        logger.warning("WhatsApp download failed for %s: %s", media_id, e)
+        return _download_media_bytes(media_url, headers=headers)
+    except (requests.RequestException, ValueError, AttributeError, TypeError) as e:
+        logger.warning("WhatsApp download failed for %s: %s", media_id, type(e).__name__)
         return None
 
 
@@ -259,15 +300,15 @@ def _convert_heic_to_jpeg(file_content, filename):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ("heic", "heif") or not _HEIF_AVAILABLE:
         return file_content, filename
+    from PIL import Image, UnidentifiedImageError
     try:
-        from PIL import Image
         with Image.open(io.BytesIO(file_content)) as img:
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=95)
             new_name = filename.rsplit(".", 1)[0] + ".jpg"
             return buf.getvalue(), new_name
-    except Exception as e:
-        logger.warning("HEIC→JPEG conversion failed for %s: %s", filename, e)
+    except (UnidentifiedImageError, OSError, ValueError) as e:
+        logger.warning("HEIC→JPEG conversion failed for %s: %s", filename, type(e).__name__)
         return file_content, filename
 
 
@@ -580,107 +621,113 @@ def _truncate(text, max_len):
     return (text[:max_len] + "...") if len(text) > max_len else text
 
 
+BOT_HTTP_TIMEOUT = (5, 10)
+
+
+def _telegram_post(method, payload, description):
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            json=payload,
+            timeout=BOT_HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        logger.warning("Telegram %s failed: %s", description, type(e).__name__)
+        return False
+    if not response.ok:
+        logger.warning("Telegram %s returned HTTP %s", description, response.status_code)
+    return response.ok
+
+
+def _whatsapp_post(recipient, body, description):
+    try:
+        response = requests.post(
+            f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages",
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"messaging_product": "whatsapp", "to": recipient, **body},
+            timeout=BOT_HTTP_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        logger.warning("WhatsApp %s failed: %s", description, type(e).__name__)
+        return False
+    if not response.ok:
+        logger.warning("WhatsApp %s returned HTTP %s", description, response.status_code)
+    return response.ok
+
+
 def send_message(platform, recipient, text):
-    try:
-        if platform == "telegram":
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": recipient, "text": text, "parse_mode": "HTML"},
-                timeout=5,
-            )
-        elif platform == "whatsapp":
-            requests.post(
-                f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": recipient,
-                    "type": "text",
-                    "text": {"preview_url": True, "body": text},
-                },
-                timeout=5,
-            )
-    except Exception as e:
-        logger.warning("Failed to send %s message to %s: %s", platform, recipient, e)
+    if platform == "telegram":
+        return _telegram_post(
+            "sendMessage",
+            {"chat_id": recipient, "text": text, "parse_mode": "HTML"},
+            "message",
+        )
+    if platform == "whatsapp":
+        return _whatsapp_post(
+            recipient,
+            {"type": "text", "text": {"preview_url": True, "body": text}},
+            "message",
+        )
+    return False
 
 
-def send_telegram_buttons(chat_id, text, buttons):
-    keyboard = {"inline_keyboard": [[btn] for btn in buttons]}
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": chat_id,
+def send_buttons(platform, recipient, text, buttons, single_row=False):
+    if platform == "telegram":
+        keys = [{"text": b.get("text", b["title"]), "callback_data": b["id"]} for b in buttons]
+        return _telegram_post(
+            "sendMessage",
+            {
+                "chat_id": recipient,
                 "text": text,
                 "parse_mode": "HTML",
-                "reply_markup": keyboard,
+                "reply_markup": {
+                    "inline_keyboard": [keys] if single_row else [[key] for key in keys]
+                },
             },
-            timeout=5,
+            "buttons",
         )
-    except Exception as e:
-        logger.warning("Failed to send Telegram buttons to %s: %s", chat_id, e)
+    if platform == "whatsapp":
+        return _whatsapp_post(
+            recipient,
+            {
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": text},
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                            for b in buttons
+                        ]
+                    },
+                },
+            },
+            "buttons",
+        )
+    return False
+
+
+CONFIRM_LINK_BUTTONS = (
+    {"id": "link_yes", "title": "Yes, correct"},
+    {"id": "link_no", "title": "No, wrong"},
+)
+
+ADD_INFO_BUTTONS = (
+    {"id": "add_info_yes", "title": "Yes, add info"},
+    {"id": "add_info_no", "title": "No, analyze now"},
+)
 
 
 def send_confirmation_buttons(platform, recipient, link):
     text = MESSAGE_TEMPLATES["link_confirmation"][platform].replace("{link}", link)
-
-    try:
-        if platform == "telegram":
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": recipient,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "reply_markup": {
-                        "inline_keyboard": [[
-                            {"text": "Yes, correct", "callback_data": "link_yes"},
-                            {"text": "No, wrong",    "callback_data": "link_no"},
-                        ]]
-                    },
-                },
-                timeout=5,
-            )
-        elif platform == "whatsapp":
-            requests.post(
-                f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": recipient,
-                    "type": "interactive",
-                    "interactive": {
-                        "type": "button",
-                        "body": {"text": text},
-                        "action": {
-                            "buttons": [
-                                {"type": "reply", "reply": {"id": "link_yes", "title": "Yes, correct"}},
-                                {"type": "reply", "reply": {"id": "link_no",  "title": "No, wrong"}},
-                            ]
-                        },
-                    },
-                },
-                timeout=5,
-            )
-    except Exception as e:
-        logger.warning("Failed to send confirmation buttons to %s: %s", recipient, e)
+    send_buttons(platform, recipient, text, list(CONFIRM_LINK_BUTTONS), single_row=True)
 
 
 def answer_telegram_callback(callback_query_id):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": callback_query_id},
-            timeout=5,
-        )
-    except Exception as e:
-        logger.warning("Failed to answer callback query %s: %s", callback_query_id, e)
+    _telegram_post("answerCallbackQuery", {"callback_query_id": callback_query_id}, "callback answer")
 
 
 def _is_empty_analysis(enriched_data):
@@ -706,9 +753,8 @@ def process_uploaded_poster(
     activity_user=None,
     group_ids=None,
 ):
+    poster = existing_poster or ResearchPoster()
     try:
-        poster = existing_poster or ResearchPoster()
-
         if image_content and not existing_poster:
             image_content, filename = _convert_heic_to_jpeg(image_content, filename)
             poster.image.save(filename, ContentFile(image_content))
@@ -803,6 +849,10 @@ def process_uploaded_poster(
                         poster.delete()
                 return existing, enriched_data, "duplicate"
 
+        for link_field in ("paper_link", "github_link"):
+            if existing_poster and not enriched_data.get(link_field):
+                enriched_data[link_field] = getattr(existing_poster, link_field, "") or ""
+
         for field, (key, default) in {
             "title":       ("title", "Untitled"),
             "authors":     ("authors", ""),
@@ -814,8 +864,10 @@ def process_uploaded_poster(
         }.items():
             setattr(poster, field, enriched_data.get(key, default))
 
-        poster.ai_paper_link = enriched_data.get("paper_link", "")
-        poster.ai_github_link = enriched_data.get("github_link", "")
+        if "paper_link" not in overrides:
+            poster.ai_paper_link = enriched_data.get("paper_link", "")
+        if "github_link" not in overrides:
+            poster.ai_github_link = enriched_data.get("github_link", "")
 
         raw_year = enriched_data.get("publication_year", "")
         if raw_year:
@@ -885,17 +937,19 @@ def process_uploaded_poster(
                 defaults={"why_useful": poster.why_useful},
             )
 
-        ActivityLog.objects.create(
-            user=activity_user,
+        ActivityLog.objects.get_or_create(
             poster=poster,
             action="created",
-            poster_title=poster.title,
-            details=f"Uploaded via {source} + AI analysis",
+            defaults={
+                "user": activity_user,
+                "poster_title": poster.title,
+                "details": f"Uploaded via {source} + AI analysis",
+            },
         )
         return poster, enriched_data, None
 
     except Exception as e:
-        logger.error("process_uploaded_poster failed: %s", e)
+        logger.exception("process_uploaded_poster failed for poster %s", getattr(poster, "pk", None))
         return None, None, str(e)
 
 
@@ -993,7 +1047,10 @@ def _dispatch_bot_analysis(platform, recipient, poster_id, notes, tags, user_id=
 
 
 def _handle_bot_retry(platform, recipient, poster_id):
-    poster = ResearchPoster.objects.filter(pk=poster_id).first()
+    bot_user = _require_link_or_notify(platform, recipient)
+    if bot_user is None:
+        return
+    poster = accessible_posters(bot_user).filter(pk=poster_id).first()
     if not poster:
         send_message(platform, recipient, MESSAGE_TEMPLATES["paper_not_found"][platform])
         return
@@ -1003,11 +1060,10 @@ def _handle_bot_retry(platform, recipient, poster_id):
     if _check_ratelimit(platform, recipient):
         send_message(platform, recipient, MESSAGE_TEMPLATES["ratelimit"][platform])
         return
-    bot_user = _get_bot_user(platform, recipient)
     _dispatch_bot_analysis(
         platform, recipient, poster_id,
         notes=poster.notes, tags=poster.tags,
-        user_id=bot_user.pk if bot_user else None,
+        user_id=bot_user.pk,
     )
 
 
@@ -1034,43 +1090,11 @@ def _handle_media_upload(platform, recipient, media_content, filename, caption=N
 
     _set_pending(platform, recipient, {"poster_id": poster.pk, "state": "awaiting_add_info"})
 
-    text_msg = MESSAGE_TEMPLATES["ask_add_info"][platform]
-    if platform == "telegram":
-        send_telegram_buttons(
-            recipient,
-            text_msg,
-            [
-                {"text": "Yes, add info",   "callback_data": "add_info_yes"},
-                {"text": "No, analyze now", "callback_data": "add_info_no"},
-            ],
-        )
-    else:
-        try:
-            requests.post(
-                f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_ID}/messages",
-                headers={
-                    "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "messaging_product": "whatsapp",
-                    "to": recipient,
-                    "type": "interactive",
-                    "interactive": {
-                        "type": "button",
-                        "body": {"text": text_msg},
-                        "action": {
-                            "buttons": [
-                                {"type": "reply", "reply": {"id": "add_info_yes", "title": "Yes, add info"}},
-                                {"type": "reply", "reply": {"id": "add_info_no",  "title": "No, analyze now"}},
-                            ]
-                        },
-                    },
-                },
-                timeout=5,
-            )
-        except Exception as e:
-            logger.warning("WhatsApp button send failed: %s", e)
+    send_buttons(
+        platform, recipient,
+        MESSAGE_TEMPLATES["ask_add_info"][platform],
+        list(ADD_INFO_BUTTONS),
+    )
 
 
 def _handle_pending_validation_text(platform, recipient, text):
@@ -1102,13 +1126,10 @@ def _handle_pending_validation_text(platform, recipient, text):
 
         else:
             if platform == "telegram":
-                send_telegram_buttons(
-                    recipient,
+                send_buttons(
+                    platform, recipient,
                     MESSAGE_TEMPLATES["unrecognized_ask_info"][platform],
-                    [
-                        {"text": "Yes, add info",   "callback_data": "add_info_yes"},
-                        {"text": "No, analyze now", "callback_data": "add_info_no"},
-                    ],
+                    list(ADD_INFO_BUTTONS),
                 )
             else:
                 send_message(platform, recipient, MESSAGE_TEMPLATES["reply_1_or_2"][platform])
@@ -1188,19 +1209,32 @@ def _handle_pending_callback(platform, recipient, callback_data):
             send_message(platform, recipient, MESSAGE_TEMPLATES["ask_url"][platform])
 
 
+def _bot_poster_scope(platform, recipient):
+    user = _require_link_or_notify(platform, recipient)
+    return accessible_posters(user) if user else None
+
+
 def _handle_dashboard_command(platform, recipient):
+    scope = _bot_poster_scope(platform, recipient)
+    if scope is None:
+        return
+
     bold, italic, link_fn = _fmt(platform)
 
-    total    = ResearchPoster.objects.count()
-    pending  = ResearchPoster.objects.filter(validation_status="pending").count()
-    approved = ResearchPoster.objects.filter(validation_status="approved").count()
-    rejected = ResearchPoster.objects.filter(validation_status="rejected").count()
+    counts = scope.aggregate(
+        total=Count("id", distinct=True),
+        pending=Count("id", filter=Q(validation_status="pending"), distinct=True),
+        approved=Count("id", filter=Q(validation_status="approved"), distinct=True),
+        rejected=Count("id", filter=Q(validation_status="rejected"), distinct=True),
+    )
+    total, pending = counts["total"], counts["pending"]
+    approved, rejected = counts["approved"], counts["rejected"]
 
     top_cats = (
-        ResearchPoster.objects
+        scope
         .exclude(category="other")
         .values("category")
-        .annotate(n=Count("id"))
+        .annotate(n=Count("id", distinct=True))
         .order_by("-n")[:3]
     )
     cat_labels = dict(ResearchPoster.CATEGORY_CHOICES)
@@ -1209,7 +1243,7 @@ def _handle_dashboard_command(platform, recipient):
         for c in top_cats
     ) if top_cats else "—"
 
-    recent = ResearchPoster.objects.order_by("-created_at")[:5]
+    recent = scope.order_by("-created_at")[:5]
 
     msg_parts = [
         f"{bold('📊 Research Collection')}\n",
@@ -1237,6 +1271,10 @@ def _handle_search_command(platform, recipient, query):
         send_message(platform, recipient, MESSAGE_TEMPLATES["search_usage"][platform])
         return
 
+    scope = _bot_poster_scope(platform, recipient)
+    if scope is None:
+        return
+
     import html as html_mod
 
     year_from = None
@@ -1254,7 +1292,7 @@ def _handle_search_command(platform, recipient, query):
 
     safe_query = html_mod.escape(query) if platform == "telegram" else query
 
-    qs = ResearchPoster.objects.exclude(validation_status="rejected")
+    qs = scope.exclude(validation_status="rejected")
     if query:
         q_filter = (
             Q(title__icontains=query) | Q(authors__icontains=query) |
@@ -1262,7 +1300,7 @@ def _handle_search_command(platform, recipient, query):
             Q(subfields__icontains=query) | Q(category__icontains=query)
         )
 
-    
+
         query_lower = query.lower()
         query_slug = query_lower.replace(" ", "_").replace("-", "_")
         if query_slug != query_lower:
@@ -1271,7 +1309,7 @@ def _handle_search_command(platform, recipient, query):
         for cat_slug, cat_label in ResearchPoster.CATEGORY_CHOICES:
             if query_lower in cat_label.lower():
                 q_filter |= Q(category=cat_slug)
-                
+
         for sf_slug, sf_label in ResearchPoster.SUBFIELD_CHOICES:
             if query_lower in sf_label.lower():
                 q_filter |= Q(subfields__icontains=sf_slug)
@@ -1463,7 +1501,7 @@ def tags_autocomplete(request):
         return JsonResponse([], safe=False)
 
     all_tags = (
-        ResearchPoster.objects
+        accessible_posters(request.user)
         .exclude(tags__isnull=True)
         .exclude(tags="")
         .filter(tags__icontains=q)
@@ -1535,7 +1573,7 @@ def conference_search(request):
 
 @login_required(login_url="login")
 def upload_poster(request):
-    is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+    is_ajax = _is_ajax(request)
 
     if not user_can_interact(request.user) and request.method == "POST":
         msg = "Your account is not in any research group yet. Uploads are disabled until an administrator adds you."
@@ -1833,7 +1871,9 @@ def dashboard(request):
 
 @login_required(login_url="login")
 def poster_detail(request, poster_id):
-    poster      = get_object_or_404(ResearchPoster.objects.select_related("uploaded_by"), id=poster_id)
+    poster      = get_accessible_poster_or_404(
+        request.user, poster_id, ResearchPoster.objects.select_related("uploaded_by"),
+    )
     is_favorite = Favorite.objects.filter(user=request.user, poster=poster).exists()
 
     user_group_ids_set = set(UserGroupMembership.objects.filter(user=request.user).values_list("group_id", flat=True))
@@ -1881,7 +1921,15 @@ def poster_detail(request, poster_id):
 
 @_groups_required
 def edit_poster(request, poster_id):
-    poster = get_object_or_404(ResearchPoster, id=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
+    next_url = (
+        request.POST.get("next") or request.GET.get("next")
+        or request.META.get("HTTP_REFERER", "")
+    ).strip()
+    if not url_has_allowed_host_and_scheme(
+        next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure(),
+    ):
+        next_url = ""
     if request.method == "POST":
         form = PosterEditForm(request.POST, instance=poster)
         if form.is_valid():
@@ -1892,18 +1940,16 @@ def edit_poster(request, poster_id):
                 details=f'Paper "{poster.title}" updated',
             )
             messages.success(request, "Paper updated successfully!")
-            next_url = request.POST.get("next") or request.GET.get("next") or "dashboard"
-            return redirect(next_url)
+            return redirect(next_url or "dashboard")
     else:
         form = PosterEditForm(instance=poster)
-    next_url = request.GET.get("next", request.META.get("HTTP_REFERER", ""))
     return render(request, "edit_poster.html", {"form": form, "poster": poster, "next_url": next_url})
 
 
 @_groups_required
 def update_status(request, poster_id):
     if request.method == "POST":
-        poster     = get_object_or_404(ResearchPoster, id=poster_id)
+        poster     = get_accessible_poster_or_404(request.user, poster_id)
         new_status = request.POST.get("status")
         if new_status in ("pending", "approved", "rejected"):
             old_status               = poster.validation_status
@@ -1914,7 +1960,7 @@ def update_status(request, poster_id):
                 poster_title=poster.title,
                 details=f"Status: {old_status} → {new_status}",
             )
-            if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            if _is_ajax(request):
                 return JsonResponse({
                     "success":    True,
                     "new_status": new_status,
@@ -1929,15 +1975,10 @@ def update_status(request, poster_id):
 @_groups_required
 def delete_poster(request, poster_id):
     if request.method == "POST":
-        poster = get_object_or_404(ResearchPoster, id=poster_id)
+        poster = get_accessible_poster_or_404(request.user, poster_id)
         title  = poster.title
 
-        if poster.image:
-            try:
-                if os.path.isfile(poster.image.path):
-                    os.remove(poster.image.path)
-            except Exception:
-                pass
+        _remove_poster_image(poster)
 
         activity = ActivityLog.objects.create(
             user=request.user, poster=None, action="deleted",
@@ -1946,7 +1987,7 @@ def delete_poster(request, poster_id):
         )
         poster.delete()
 
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        if _is_ajax(request):
             return JsonResponse({
                 "success":  True,
                 "message":  f'Paper "{title}" deleted successfully!',
@@ -1960,7 +2001,7 @@ def delete_poster(request, poster_id):
 @_groups_required
 def toggle_favorite(request, poster_id):
     if request.method == "POST":
-        poster            = get_object_or_404(ResearchPoster, id=poster_id)
+        poster            = get_accessible_poster_or_404(request.user, poster_id)
         favorite, created = Favorite.objects.get_or_create(user=request.user, poster=poster)
 
         if created:
@@ -1988,7 +2029,7 @@ def toggle_favorite(request, poster_id):
 @_groups_required
 def update_notes(request, poster_id):
     if request.method == "POST":
-        poster = get_object_or_404(ResearchPoster, id=poster_id)
+        poster = get_accessible_poster_or_404(request.user, poster_id)
         try:
             notes = json.loads(request.body).get("notes", "").strip()
         except (json.JSONDecodeError, AttributeError):
@@ -2004,7 +2045,7 @@ def update_notes(request, poster_id):
             poster_title=poster.title,
             details="Notes updated",
         )
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        if _is_ajax(request):
             return JsonResponse({
                 "success":  True,
                 "message":  "Notes saved!",
@@ -2019,7 +2060,7 @@ def update_notes(request, poster_id):
 def update_tags(request, poster_id):
     if request.method != "POST":
         return JsonResponse({"success": False}, status=400)
-    poster = get_object_or_404(ResearchPoster, id=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
     try:
         tags = json.loads(request.body).get("tags", "").strip()
     except (json.JSONDecodeError, AttributeError):
@@ -2056,64 +2097,75 @@ def bulk_action(request):
     if not ids:
         return JsonResponse({"success": False, "error": "No papers selected"}, status=400)
 
-    posters = ResearchPoster.objects.filter(id__in=ids)
-    count   = posters.count()
+    allowed_ids = list(
+        accessible_posters(request.user)
+        .filter(id__in=ids)
+        .values_list("pk", flat=True)
+    )
+    posters = ResearchPoster.objects.filter(pk__in=allowed_ids)
+    count   = len(allowed_ids)
 
     if action in ("pending", "approved", "rejected"):
-        for poster in posters:
-            old = poster.validation_status
-            poster.validation_status = action
-            poster.save(update_fields=["validation_status", "updated_at"])
-            ActivityLog.objects.create(
+        logs = [
+            ActivityLog(
                 user=request.user, poster=poster, action="status_changed",
                 poster_title=poster.title,
-                details=f"Bulk status: {old} → {action}",
+                details=f"Bulk status: {poster.validation_status} → {action}",
             )
+            for poster in posters
+        ]
+        posters.update(validation_status=action, updated_at=timezone.now())
+        ActivityLog.objects.bulk_create(logs)
         message = f"{count} papers set to {action.capitalize()}"
 
     elif action == "delete":
+        logs = []
         for poster in posters:
-            if poster.image:
-                try:
-                    if os.path.isfile(poster.image.path):
-                        os.remove(poster.image.path)
-                except Exception:
-                    pass
-            ActivityLog.objects.create(
+            _remove_poster_image(poster)
+            logs.append(ActivityLog(
                 user=request.user, poster=None, action="deleted",
                 poster_title=poster.title,
                 details=f'Paper "{poster.title}" deleted (bulk)',
-            )
+            ))
         posters.delete()
+        ActivityLog.objects.bulk_create(logs)
         message = f"{count} papers deleted"
 
     elif action == "favorite":
-        changed = 0
-        for poster in posters:
-            _, created = Favorite.objects.get_or_create(user=request.user, poster=poster)
-            if created:
-                changed += 1
-                ActivityLog.objects.create(
-                    user=request.user, poster=poster, action="favorited",
-                    poster_title=poster.title,
-                    details=f'Paper "{poster.title}" favorited (bulk)',
-                )
-        message = f"{changed} papers starred"
+        already = set(
+            Favorite.objects
+            .filter(user=request.user, poster__in=posters)
+            .values_list("poster_id", flat=True)
+        )
+        missing = [poster for poster in posters if poster.pk not in already]
+        Favorite.objects.bulk_create(
+            [Favorite(user=request.user, poster=poster) for poster in missing],
+            ignore_conflicts=True,
+        )
+        ActivityLog.objects.bulk_create([
+            ActivityLog(
+                user=request.user, poster=poster, action="favorited",
+                poster_title=poster.title,
+                details=f'Paper "{poster.title}" favorited (bulk)',
+            )
+            for poster in missing
+        ])
+        message = f"{len(missing)} papers starred"
 
     elif action == "unfavorite":
         favorites    = Favorite.objects.filter(user=request.user, poster__in=posters)
         favorite_ids = set(favorites.values_list("poster_id", flat=True))
         favorites.delete()
-        changed = 0
-        for poster in posters:
-            if poster.id in favorite_ids:
-                changed += 1
-                ActivityLog.objects.create(
-                    user=request.user, poster=poster, action="unfavorited",
-                    poster_title=poster.title,
-                    details=f'Paper "{poster.title}" unfavorited (bulk)',
-                )
-        message = f"{changed} papers unstarred"
+        unstarred = [poster for poster in posters if poster.pk in favorite_ids]
+        ActivityLog.objects.bulk_create([
+            ActivityLog(
+                user=request.user, poster=poster, action="unfavorited",
+                poster_title=poster.title,
+                details=f'Paper "{poster.title}" unfavorited (bulk)',
+            )
+            for poster in unstarred
+        ])
+        message = f"{len(unstarred)} papers unstarred"
 
     else:
         return JsonResponse({"success": False, "error": "Unknown action"}, status=400)
@@ -2126,12 +2178,12 @@ def bulk_action(request):
     })
 
 
-@_groups_required
+@_admin_required
 def delete_all_activities(request):
     if request.method == "POST":
         count = ActivityLog.objects.count()
         ActivityLog.objects.all().delete()
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        if _is_ajax(request):
             return JsonResponse({"success": True, "message": f"Successfully deleted {count} activity logs"})
         messages.success(request, f"Successfully deleted {count} activity logs")
         return redirect("dashboard")
@@ -2142,7 +2194,7 @@ def delete_all_activities(request):
 def retry_analysis(request, poster_id):
     if request.method != "POST":
         return JsonResponse({"success": False}, status=405)
-    poster = get_object_or_404(ResearchPoster, id=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
     if poster.analysis_status == 'processing':
         return JsonResponse({"success": False, "error": "Analysis is already running"}, status=400)
     poster.analysis_status = 'processing'
@@ -2162,7 +2214,7 @@ def retry_analysis(request, poster_id):
 def stop_analysis(request, poster_id):
     if request.method != "POST":
         return JsonResponse({"success": False}, status=405)
-    poster = get_object_or_404(ResearchPoster, id=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
 
     task_id = cache.get(f"bot:task:{poster_id}") or cache.get(f"task:poster:{poster_id}")
     if task_id:
@@ -2189,7 +2241,7 @@ def stop_analysis(request, poster_id):
 
     return JsonResponse({"success": True, "message": "Analysis stopped"})
 
- 
+
 @login_required(login_url="login")
 def dashboard_live_status(request):
     from django.db.models import Max
@@ -2217,7 +2269,7 @@ EXPORT_FIELDS = [
 def _get_export_queryset(request):
     return (
         _apply_filters(
-            ResearchPoster.objects.select_related("uploaded_by").all(),
+            accessible_posters(request.user, ResearchPoster.objects.select_related("uploaded_by")),
             request.GET,
             favorite_user=request.user,
         )
@@ -2240,16 +2292,24 @@ def _poster_to_row(poster):
     ]
 
 
+def _csv_safe_cell(value):
+    if isinstance(value, str) and value:
+        if value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+    return value
+
+
 @login_required(login_url="login")
 def export_approved_csv(request):
     posters  = _get_export_queryset(request)
     filename = f"approved_posters_{timezone.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
+    response = HttpResponse(content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.write(BOM_UTF8)
     writer = csv.writer(response, delimiter=";")
     writer.writerow(EXPORT_FIELDS)
     for p in posters:
-        writer.writerow(_poster_to_row(p))
+        writer.writerow(_csv_safe_cell(value) for value in _poster_to_row(p))
     return response
 
 
@@ -2522,13 +2582,16 @@ def set_my_primary_group(request):
 @_groups_required
 def poster_why_useful_for_group(request, poster_id):
 
-    poster = get_object_or_404(ResearchPoster, pk=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
     group_id = request.GET.get("group_id", "")
 
     if not group_id:
         return JsonResponse({"why_useful": poster.why_useful or ""})
 
     group = get_object_or_404(ResearchGroup, pk=group_id)
+
+    if not can_access_group(request.user, group.pk):
+        return JsonResponse({"error": "Forbidden"}, status=403)
 
     if not poster.groups.filter(pk=group.pk).exists():
         return JsonResponse({"error": "Group not assigned to this paper"}, status=403)
@@ -2563,7 +2626,7 @@ def update_poster_groups(request, poster_id):
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
 
-    poster = get_object_or_404(ResearchPoster, pk=poster_id)
+    poster = get_accessible_poster_or_404(request.user, poster_id)
 
     user_group_ids = set(
         UserGroupMembership.objects
@@ -2571,10 +2634,6 @@ def update_poster_groups(request, poster_id):
         .values_list("group_id", flat=True)
     )
     current_group_ids = set(poster.groups.values_list("pk", flat=True))
-
-    if not request.user.is_superuser:
-        if not (user_group_ids & current_group_ids):
-            return JsonResponse({"error": "Forbidden"}, status=403)
 
     try:
         body = json.loads(request.body or "{}")
@@ -2590,7 +2649,7 @@ def update_poster_groups(request, poster_id):
             requested.add(int(gid))
         except (ValueError, TypeError):
             continue
-            
+
     allowed_new = requested & user_group_ids
     preserved = current_group_ids - user_group_ids
     if not allowed_new and not preserved:
@@ -2648,7 +2707,8 @@ def user_admin_list(request):
     users_qs = (
         User.objects
         .filter(is_active=True)
-        .prefetch_related("group_memberships__group", "uploaded_posters", "groups")
+        .prefetch_related("group_memberships__group", "groups")
+        .annotate(uploaded_count=Count("uploaded_posters", distinct=True))
         .order_by("-is_superuser", "-is_staff", "username")
     )
     if search:
@@ -2671,7 +2731,6 @@ def user_admin_list(request):
     users = list(page_obj.object_list)
     for u in users:
         u.group_names = [m.group.name for m in u.group_memberships.all()]
-        u.uploaded_count = u.uploaded_posters.count()
         u.is_group_manager_role = any(g.name == GROUP_MANAGER_ROLE for g in u.groups.all())
 
     paginate_qs_base = f"q={search}" if search else ""
@@ -2757,10 +2816,11 @@ def telegram_webhook(request):
     if request.method != "POST":
         return HttpResponse("Telegram Bot Active", status=200)
 
-    _tg_secret = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "")
-    if _tg_secret:
-        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if header_secret != _tg_secret:
+    telegram_secret = getattr(settings, "TELEGRAM_WEBHOOK_SECRET", "")
+    if telegram_secret:
+        presented = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(presented, telegram_secret):
+            logger.warning("Rejected a Telegram webhook call with an invalid secret token")
             return HttpResponse("Forbidden", status=403)
 
     try:
@@ -2837,18 +2897,36 @@ def telegram_webhook(request):
     return HttpResponse("OK", status=200)
 
 
+def _whatsapp_signature_is_valid(request):
+    app_secret = getattr(settings, "WHATSAPP_APP_SECRET", "")
+    if not app_secret:
+        return True
+    presented = request.headers.get("X-Hub-Signature-256", "")
+    if not presented.startswith("sha256="):
+        logger.warning("Rejected a WhatsApp webhook call with no payload signature")
+        return False
+    expected = hmac.new(app_secret.encode(), request.body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(presented[len("sha256="):], expected):
+        logger.warning("Rejected a WhatsApp webhook call with an invalid payload signature")
+        return False
+    return True
+
+
 @csrf_exempt
 def whatsapp_webhook(request):
     if request.method == "GET":
         mode      = request.GET.get("hub.mode")
         token     = request.GET.get("hub.verify_token")
         challenge = request.GET.get("hub.challenge")
-        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+        if mode == "subscribe" and WHATSAPP_VERIFY_TOKEN and hmac.compare_digest(token or "", WHATSAPP_VERIFY_TOKEN):
             return HttpResponse(challenge, status=200)
         return HttpResponse("Forbidden", status=403)
 
     if request.method != "POST":
         return HttpResponse("OK", status=200)
+
+    if not _whatsapp_signature_is_valid(request):
+        return HttpResponse("Forbidden", status=403)
 
     try:
         body    = json.loads(request.body.decode("utf-8"))
