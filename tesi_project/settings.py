@@ -10,6 +10,9 @@ DEBUG = os.getenv("DEBUG", "True").lower() == "true"
 if not _secret and not DEBUG:
     raise RuntimeError("SECRET_KEY must be set in production (DEBUG=False)")
 SECRET_KEY = _secret or "django-insecure-chiave-di-sviluppo"
+SECRET_KEY_FALLBACKS = [
+    key.strip() for key in os.getenv("SECRET_KEY_FALLBACKS", "").split(",") if key.strip()
+]
 _default_hosts = "*" if DEBUG else "localhost,127.0.0.1"
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", _default_hosts).split(",")
 
